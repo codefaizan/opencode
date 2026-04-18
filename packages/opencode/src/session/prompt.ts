@@ -49,6 +49,8 @@ import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { EffectBridge } from "@/effect"
+import { ExecutionMode, resolveExecutionMode, type ExecutionMode as SessionExecutionMode } from "./execution-mode"
+import { SessionProposedFiles } from "./proposed-files"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -73,6 +75,11 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+}
+
+interface PromptRuntime {
+  readonly executionMode: SessionExecutionMode
+  readonly proposedFiles?: SessionProposedFiles.Run
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -106,12 +113,12 @@ export const layer = Layer.effect(
     const runner = Effect.fn("SessionPrompt.runner")(function* () {
       return yield* EffectBridge.make()
     })
-    const ops = Effect.fn("SessionPrompt.ops")(function* () {
+    const ops = Effect.fn("SessionPrompt.ops")(function* (runtime?: PromptRuntime) {
       const run = yield* runner()
       return {
         cancel: (sessionID: SessionID) => run.fork(cancel(sessionID)),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input),
+        prompt: (input: PromptInput) => prompt(input, runtime),
       } satisfies TaskPromptOps
     })
 
@@ -359,17 +366,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
       bypassAgentCheck: boolean
       messages: MessageV2.WithParts[]
+      runtime: PromptRuntime
     }) {
       using _ = log.time("resolveTools")
       const tools: Record<string, AITool> = {}
       const run = yield* runner()
-      const promptOps = yield* ops()
+      const promptOps = yield* ops(input.runtime)
 
       const context = (args: any, options: ToolExecutionOptions): Tool.Context => ({
         sessionID: input.session.id,
         abort: options.abortSignal!,
         messageID: input.processor.message.id,
         callID: options.toolCallId,
+        executionMode: input.runtime.executionMode,
+        proposedFiles: input.runtime.proposedFiles,
         extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
         agent: input.agent.name,
         messages: input.messages,
@@ -529,10 +539,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       sessionID: SessionID
       session: Session.Info
       msgs: MessageV2.WithParts[]
+      runtime: PromptRuntime
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
-      const promptOps = yield* ops()
+      const promptOps = yield* ops(input.runtime)
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: MessageV2.Assistant = yield* sessions.updateMessage({
@@ -596,6 +607,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           agent: task.agent,
           messageID: assistantMessage.id,
           sessionID,
+          executionMode: input.runtime.executionMode,
+          proposedFiles: input.runtime.proposedFiles,
           abort: taskAbort.signal,
           callID: part.callID,
           extra: { bypassAgentCheck: true, promptOps },
@@ -1273,8 +1286,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
-      function* (input: PromptInput) {
+    const prompt: (input: PromptInput, runtime?: PromptRuntime) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
+      "SessionPrompt.prompt",
+    )(function* (input: PromptInput, runtime?: PromptRuntime) {
         const session = yield* sessions.get(input.sessionID)
         yield* revert.cleanup(session)
         const message = yield* createUserMessage(input)
@@ -1290,9 +1304,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }
 
         if (input.noReply === true) return message
-        return yield* loop({ sessionID: input.sessionID })
-      },
-    )
+        return yield* loop({ sessionID: input.sessionID, executionMode: input.executionMode }, runtime)
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
@@ -1302,8 +1315,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (input: { sessionID: SessionID; runtime: PromptRuntime }) => Effect.Effect<MessageV2.WithParts> =
+      Effect.fn("SessionPrompt.run")(function* (input: { sessionID: SessionID; runtime: PromptRuntime }) {
+        const sessionID = input.sessionID
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown | undefined
@@ -1365,7 +1379,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs, runtime: input.runtime })
             continue
           }
 
@@ -1436,6 +1450,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               processor: handle,
               bypassAgentCheck,
               messages: msgs,
+              runtime: input.runtime,
             })
 
             if (lastUser.format?.type === "json_schema") {
@@ -1529,13 +1544,29 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
-      },
-    )
+      })
 
-    const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
+    const loop: (input: z.infer<typeof LoopInput>, runtime?: PromptRuntime) => Effect.Effect<MessageV2.WithParts> =
+      Effect.fn(
       "SessionPrompt.loop",
-    )(function* (input: z.infer<typeof LoopInput>) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+    )(function* (input: z.infer<typeof LoopInput>, runtime?: PromptRuntime) {
+      const executionMode = runtime?.executionMode ?? resolveExecutionMode(input.executionMode)
+      const nextRuntime: PromptRuntime =
+        runtime ??
+        (executionMode === "propose"
+          ? {
+              executionMode,
+              proposedFiles: SessionProposedFiles.create(),
+            }
+          : {
+              executionMode,
+            })
+
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop({ sessionID: input.sessionID, runtime: nextRuntime }),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
@@ -1719,6 +1750,7 @@ export const PromptInput = z.object({
   format: MessageV2.Format.optional(),
   system: z.string().optional(),
   variant: z.string().optional(),
+  executionMode: ExecutionMode.optional(),
   parts: z.array(
     z.discriminatedUnion("type", [
       MessageV2.TextPart.omit({
@@ -1768,6 +1800,7 @@ export type PromptInput = z.infer<typeof PromptInput>
 
 export const LoopInput = z.object({
   sessionID: SessionID.zod,
+  executionMode: ExecutionMode.optional(),
 })
 
 export const ShellInput = z.object({

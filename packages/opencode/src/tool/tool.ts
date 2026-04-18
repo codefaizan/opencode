@@ -3,6 +3,9 @@ import { Effect } from "effect"
 import type { MessageV2 } from "../session/message-v2"
 import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
+import type { ExecutionMode } from "@/session/execution-mode"
+import { resolveExecutionMode } from "@/session/execution-mode"
+import type { SessionProposedFiles } from "@/session/proposed-files"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
 
@@ -17,6 +20,8 @@ export type Context<M extends Metadata = Metadata> = {
   sessionID: SessionID
   messageID: MessageID
   agent: string
+  executionMode?: ExecutionMode
+  proposedFiles?: SessionProposedFiles.Run
   abort: AbortSignal
   callID?: string
   extra?: { [key: string]: unknown }
@@ -47,6 +52,10 @@ export type DefWithoutID<Parameters extends z.ZodType = z.ZodType, M extends Met
 export interface Info<Parameters extends z.ZodType = z.ZodType, M extends Metadata = Metadata> {
   id: string
   init: () => Effect.Effect<DefWithoutID<Parameters, M>>
+}
+
+export function executionMode(ctx: Context): ExecutionMode {
+  return resolveExecutionMode(ctx.executionMode)
 }
 
 type Init<Parameters extends z.ZodType, M extends Metadata> =

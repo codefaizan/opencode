@@ -15,12 +15,20 @@
     "theme": "dark"
   },
   "engines": {
-    "vscode": "^1.94.0"
+    "vscode": "^1.102.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Chat"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:opencode.openTerminal",
+    "onCommand:opencode.openNewTerminal",
+    "onCommand:opencode.addFilepathToTerminal",
+    "onChatParticipant:opencode.chat",
+    "onCommand:opencode.applyProposedEdits"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -43,6 +51,25 @@
       {
         "command": "opencode.addFilepathToTerminal",
         "title": "Add Filepath to Terminal"
+      },
+      {
+        "command": "opencode.applyProposedEdits",
+        "title": "opencode: Apply Proposed Edits"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "opencode.chat",
+        "name": "opencode",
+        "fullName": "opencode",
+        "description": "Generate and review proposed code edits with OpenCode",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new OpenCode propose session"
+          }
+        ]
       }
     ],
     "menus": {
@@ -94,7 +121,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.94.0",
+    "@types/vscode": "^1.102.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@typescript-eslint/eslint-plugin": "^8.31.1",

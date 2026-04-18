@@ -316,6 +316,15 @@ export function deriveNewContentsFromChunks(filePath: string, chunks: UpdateFile
     throw new Error(`Failed to read file ${filePath}: ${error}`, { cause: error })
   }
 
+  return deriveNewContentsFromSource(filePath, originalContent, chunks)
+}
+
+export function deriveNewContentsFromSource(
+  filePath: string,
+  originalContent: string,
+  chunks: UpdateFileChunk[],
+): ApplyPatchFileUpdate {
+
   let originalLines = originalContent.split("\n")
 
   // Drop trailing empty element for consistent line counting

@@ -12,6 +12,7 @@ import { Truncate } from "../../src/tool"
 import { Tool } from "../../src/tool"
 import { Agent } from "../../src/agent/agent"
 import { SessionID, MessageID } from "../../src/session/schema"
+import { SessionProposedFiles } from "../../src/session/proposed-files"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -222,6 +223,33 @@ describe("tool.write", () => {
           yield* Effect.promise(() => fs.chmod(readonlyPath, 0o444))
           const exit = yield* run({ filePath: readonlyPath, content: "new content" }).pipe(Effect.exit)
           expect(exit._tag).toBe("Failure")
+        }),
+      ),
+    )
+  })
+
+  describe("propose mode", () => {
+    it.live("stores full content in overlay without touching disk", () =>
+      provideTmpdirInstance((dir) =>
+        Effect.gen(function* () {
+          const filepath = path.join(dir, "proposed.txt")
+          yield* Effect.promise(() => fs.writeFile(filepath, "on-disk", "utf-8"))
+
+          const proposed = SessionProposedFiles.create()
+          const result = yield* run(
+            { filePath: filepath, content: "overlay-content" },
+            { ...ctx, executionMode: "propose", proposedFiles: proposed },
+          )
+
+          const entry = SessionProposedFiles.get(proposed, filepath)
+          expect(entry?.type).toBe("file")
+          if (entry?.type === "file") {
+            expect(entry.content).toBe("overlay-content")
+          }
+
+          const disk = yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))
+          expect(disk).toBe("on-disk")
+          expect(result.metadata.proposal?.mode).toBe("propose")
         }),
       ),
     )

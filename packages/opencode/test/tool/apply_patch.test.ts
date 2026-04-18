@@ -12,6 +12,7 @@ import { Bus } from "../../src/bus"
 import { Truncate } from "../../src/tool"
 import { tmpdir } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
+import { SessionProposedFiles } from "../../src/session/proposed-files"
 
 const runtime = ManagedRuntime.make(
   Layer.mergeAll(
@@ -54,6 +55,8 @@ type AskInput = {
 }
 
 type ToolCtx = typeof baseCtx & {
+  executionMode?: "direct" | "propose"
+  proposedFiles?: SessionProposedFiles.Run
   ask: (input: AskInput) => Effect.Effect<void>
 }
 
@@ -579,6 +582,178 @@ EOF`
         await execute({ patchText }, ctx)
         // Result has ASCII quotes because that's what the patch specifies
         expect(await fs.readFile(target, "utf-8")).toBe(`He said "hi"\nsome${emDash}dash\nend\n`)
+      },
+    })
+  })
+
+  test("propose mode updates overlay only and leaves disk unchanged", async () => {
+    await using fixture = await tmpdir()
+    const proposed = SessionProposedFiles.create()
+    const { calls } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const source = path.join(fixture.path, "src.txt")
+        await fs.writeFile(source, "before\n", "utf-8")
+
+        const patchText = "*** Begin Patch\n*** Update File: src.txt\n@@\n-before\n+after\n*** End Patch"
+
+        await execute(
+          { patchText },
+          {
+            ...baseCtx,
+            executionMode: "propose",
+            proposedFiles: proposed,
+            ask: (input) =>
+              Effect.sync(() => {
+                calls.push(input)
+              }),
+          },
+        )
+
+        const entry = SessionProposedFiles.get(proposed, source)
+        expect(entry?.type).toBe("file")
+        if (entry?.type === "file") {
+          expect(entry.content).toBe("after\n")
+        }
+
+        expect(await fs.readFile(source, "utf-8")).toBe("before\n")
+      },
+    })
+  })
+
+  test("propose mode keeps overlay unchanged when verification fails", async () => {
+    await using fixture = await tmpdir()
+    const proposed = SessionProposedFiles.create()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const existing = path.join(fixture.path, "existing.txt")
+        await fs.writeFile(existing, "hello\n", "utf-8")
+
+        const patchText =
+          "*** Begin Patch\n*** Add File: created.txt\n+new\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch"
+
+        await expect(
+          execute(
+            { patchText },
+            {
+              ...baseCtx,
+              executionMode: "propose",
+              proposedFiles: proposed,
+              ask: () => Effect.void,
+            },
+          ),
+        ).rejects.toThrow()
+
+        expect(SessionProposedFiles.get(proposed, path.join(fixture.path, "created.txt"))).toBeUndefined()
+      },
+    })
+  })
+
+  test("propose mode move fails when source is missing", async () => {
+    await using fixture = await tmpdir()
+    const proposed = SessionProposedFiles.create()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const patchText =
+          "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-old\n+new\n*** End Patch"
+
+        await expect(
+          execute(
+            { patchText },
+            {
+              ...baseCtx,
+              executionMode: "propose",
+              proposedFiles: proposed,
+              ask: () => Effect.void,
+            },
+          ),
+        ).rejects.toThrow("apply_patch verification failed: Failed to read file to update")
+
+        expect(SessionProposedFiles.get(proposed, path.join(fixture.path, "old/name.txt"))).toBeUndefined()
+        expect(SessionProposedFiles.get(proposed, path.join(fixture.path, "renamed/dir/name.txt"))).toBeUndefined()
+      },
+    })
+  })
+
+  test("propose mode move fails when destination already exists", async () => {
+    await using fixture = await tmpdir()
+    const proposed = SessionProposedFiles.create()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const original = path.join(fixture.path, "old", "name.txt")
+        const destination = path.join(fixture.path, "renamed", "dir", "name.txt")
+        await fs.mkdir(path.dirname(original), { recursive: true })
+        await fs.mkdir(path.dirname(destination), { recursive: true })
+        await fs.writeFile(original, "from\n", "utf-8")
+        await fs.writeFile(destination, "existing\n", "utf-8")
+
+        const patchText =
+          "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-from\n+new\n*** End Patch"
+
+        await expect(
+          execute(
+            { patchText },
+            {
+              ...baseCtx,
+              executionMode: "propose",
+              proposedFiles: proposed,
+              ask: () => Effect.void,
+            },
+          ),
+        ).rejects.toThrow(`apply_patch verification failed: Target already exists for move: ${destination}`)
+
+        expect(SessionProposedFiles.get(proposed, original)).toBeUndefined()
+        expect(SessionProposedFiles.get(proposed, destination)).toBeUndefined()
+        expect(await fs.readFile(original, "utf-8")).toBe("from\n")
+        expect(await fs.readFile(destination, "utf-8")).toBe("existing\n")
+      },
+    })
+  })
+
+  test("propose mode successful move updates overlay and leaves disk unchanged", async () => {
+    await using fixture = await tmpdir()
+    const proposed = SessionProposedFiles.create()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const original = path.join(fixture.path, "old", "name.txt")
+        const destination = path.join(fixture.path, "renamed", "dir", "name.txt")
+        await fs.mkdir(path.dirname(original), { recursive: true })
+        await fs.writeFile(original, "from\n", "utf-8")
+
+        const patchText =
+          "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-from\n+new\n*** End Patch"
+
+        await execute(
+          { patchText },
+          {
+            ...baseCtx,
+            executionMode: "propose",
+            proposedFiles: proposed,
+            ask: () => Effect.void,
+          },
+        )
+
+        const oldEntry = SessionProposedFiles.get(proposed, original)
+        const newEntry = SessionProposedFiles.get(proposed, destination)
+
+        expect(oldEntry?.type).toBe("delete")
+        expect(newEntry?.type).toBe("file")
+        if (newEntry?.type === "file") {
+          expect(newEntry.content).toBe("new\n")
+        }
+
+        expect(await fs.readFile(original, "utf-8")).toBe("from\n")
+        await expect(fs.readFile(destination, "utf-8")).rejects.toThrow()
       },
     })
   })

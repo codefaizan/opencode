@@ -1,11 +1,24 @@
-// This method is called when your extension is deactivated
-export function deactivate() {}
-
 import * as vscode from "vscode"
+import { OpencodeClient } from "./chat/opencode-client"
+import { registerOpencodeChatParticipant } from "./chat/participant"
 
 const TERMINAL_NAME = "opencode"
 
 export function activate(context: vscode.ExtensionContext) {
+  const iconPath = {
+    light: vscode.Uri.file(context.asAbsolutePath("images/button-dark.svg")),
+    dark: vscode.Uri.file(context.asAbsolutePath("images/button-light.svg")),
+  }
+
+  const chatOutput = vscode.window.createOutputChannel("opencode chat")
+  const chatClient = new OpencodeClient(chatOutput)
+
+  context.subscriptions.push(chatOutput, chatClient, ...registerOpencodeChatParticipant({
+    context,
+    client: chatClient,
+    iconPath,
+  }))
+
   const openNewTerminalDisposable = vscode.commands.registerCommand("opencode.openNewTerminal", async () => {
     await openTerminal()
   })
@@ -47,10 +60,7 @@ export function activate(context: vscode.ExtensionContext) {
     const port = Math.floor(Math.random() * (65535 - 16384 + 1)) + 16384
     const terminal = vscode.window.createTerminal({
       name: TERMINAL_NAME,
-      iconPath: {
-        light: vscode.Uri.file(context.asAbsolutePath("images/button-dark.svg")),
-        dark: vscode.Uri.file(context.asAbsolutePath("images/button-light.svg")),
-      },
+      iconPath,
       location: {
         viewColumn: vscode.ViewColumn.Beside,
         preserveFocus: false,
@@ -135,3 +145,6 @@ export function activate(context: vscode.ExtensionContext) {
     return filepathWithAt
   }
 }
+
+// This method is called when your extension is deactivated
+export function deactivate() {}

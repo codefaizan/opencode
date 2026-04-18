@@ -13,6 +13,7 @@ import { Bus } from "../../src/bus"
 import { BusEvent } from "../../src/bus/bus-event"
 import { Truncate } from "../../src/tool"
 import { SessionID, MessageID } from "../../src/session/schema"
+import { SessionProposedFiles } from "../../src/session/proposed-files"
 
 const ctx = {
   sessionID: SessionID.make("ses_test-edit-session"),
@@ -675,6 +676,44 @@ describe("tool.edit", () => {
           // Both should complete without error (though one might fail due to content mismatch)
           const results = await Promise.allSettled([promise1, promise2])
           expect(results.some((r) => r.status === "fulfilled")).toBe(true)
+        },
+      })
+    })
+  })
+
+  describe("propose mode", () => {
+    test("uses overlay content as edit base without writing to disk", async () => {
+      await using tmp = await tmpdir()
+      const filepath = path.join(tmp.path, "file.txt")
+      await fs.writeFile(filepath, "disk value", "utf-8")
+
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const edit = await resolve()
+          const proposed = SessionProposedFiles.create()
+          SessionProposedFiles.setFile(proposed, filepath, "overlay value")
+
+          const result = await Effect.runPromise(
+            edit.execute(
+              {
+                filePath: filepath,
+                oldString: "overlay",
+                newString: "future",
+              },
+              { ...ctx, executionMode: "propose", proposedFiles: proposed },
+            ),
+          )
+
+          const entry = SessionProposedFiles.get(proposed, filepath)
+          expect(entry?.type).toBe("file")
+          if (entry?.type === "file") {
+            expect(entry.content).toBe("future value")
+          }
+
+          const disk = await fs.readFile(filepath, "utf-8")
+          expect(disk).toBe("disk value")
+          expect(result.metadata.proposal?.mode).toBe("propose")
         },
       })
     })

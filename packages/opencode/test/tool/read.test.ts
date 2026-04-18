@@ -9,6 +9,7 @@ import { Permission } from "../../src/permission"
 import { Instance } from "../../src/project/instance"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Instruction } from "../../src/session/instruction"
+import { SessionProposedFiles } from "../../src/session/proposed-files"
 import { ReadTool } from "../../src/tool/read"
 import { Truncate } from "../../src/tool"
 import { Tool } from "../../src/tool"
@@ -442,6 +443,60 @@ describe("tool.read loaded instructions", () => {
       expect(result.output).toContain("Test Instructions")
       expect(result.metadata.loaded).toBeDefined()
       expect(result.metadata.loaded).toContain(path.join(dir, "subdir", "AGENTS.md"))
+    }),
+  )
+})
+
+describe("tool.read propose overlay", () => {
+  it.live("reads overlay file content before disk content", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const file = path.join(dir, "doc.txt")
+      yield* put(file, "disk-content")
+
+      const proposed = SessionProposedFiles.create()
+      SessionProposedFiles.setFile(proposed, file, "overlay-content")
+
+      const result = yield* exec(
+        dir,
+        { filePath: file },
+        {
+          ...ctx,
+          executionMode: "propose",
+          proposedFiles: proposed,
+        },
+      )
+
+      expect(result.output).toContain("overlay-content")
+      expect(result.output).not.toContain("disk-content")
+      expect(yield* load(file)).toBe("disk-content")
+    }),
+  )
+
+  it.live("directory listing reflects tombstones and overlay files", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const targetDir = path.join(dir, "items")
+      yield* put(path.join(targetDir, "a.txt"), "a")
+      yield* put(path.join(targetDir, "b.txt"), "b")
+
+      const proposed = SessionProposedFiles.create()
+      SessionProposedFiles.setDelete(proposed, path.join(targetDir, "a.txt"))
+      SessionProposedFiles.setFile(proposed, path.join(targetDir, "c.txt"), "c")
+
+      const result = yield* exec(
+        dir,
+        { filePath: targetDir },
+        {
+          ...ctx,
+          executionMode: "propose",
+          proposedFiles: proposed,
+        },
+      )
+
+      expect(result.output).toContain("b.txt")
+      expect(result.output).toContain("c.txt")
+      expect(result.output).not.toContain("a.txt")
     }),
   )
 })

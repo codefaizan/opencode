@@ -14,6 +14,8 @@ import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import DESCRIPTION from "./apply_patch.txt"
 import { File } from "../file"
 import { Format } from "../format"
+import { SessionProposedFiles } from "@/session/proposed-files"
+import { Proposal } from "./proposal"
 
 const PatchParams = z.object({
   patchText: z.string().describe("The full patch text that describes all changes to be made"),
@@ -30,6 +32,11 @@ export const ApplyPatchTool = Tool.define(
     const run = Effect.fn("ApplyPatchTool.execute")(function* (params: z.infer<typeof PatchParams>, ctx: Tool.Context) {
       if (!params.patchText) {
         return yield* Effect.fail(new Error("patchText is required"))
+      }
+      const mode = Tool.executionMode(ctx)
+      const proposedFiles = ctx.proposedFiles
+      if (mode === "propose" && !proposedFiles) {
+        return yield* Effect.fail(new Error("Propose mode requires proposedFiles context"))
       }
 
       // Parse the patch to get hunks
@@ -60,6 +67,17 @@ export const ApplyPatchTool = Tool.define(
         additions: number
         deletions: number
       }> = []
+      const stagedOverlayChanges: Array<
+        | {
+            type: "set"
+            filePath: string
+            content: string
+          }
+        | {
+            type: "delete"
+            filePath: string
+          }
+      > = []
 
       let totalDiff = ""
 
@@ -69,7 +87,12 @@ export const ApplyPatchTool = Tool.define(
 
         switch (hunk.type) {
           case "add": {
-            const oldContent = ""
+            const oldContent =
+              mode === "propose"
+                ? (yield* SessionProposedFiles.readFileString(proposedFiles, afs, filePath).pipe(
+                    Effect.catch(() => Effect.succeed("")),
+                  ))
+                : ""
             const newContent =
               hunk.contents.length === 0 || hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`
             const diff = trimDiff(createTwoFilesPatch(filePath, filePath, oldContent, newContent))
@@ -91,25 +114,40 @@ export const ApplyPatchTool = Tool.define(
               deletions,
             })
 
+            if (mode === "propose") {
+              stagedOverlayChanges.push({
+                type: "set",
+                filePath,
+                content: newContent,
+              })
+            }
+
             totalDiff += diff + "\n"
             break
           }
 
           case "update": {
-            // Check if file exists for update
-            const stats = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-            if (!stats || stats.type === "Directory") {
-              return yield* Effect.fail(
-                new Error(`apply_patch verification failed: Failed to read file to update: ${filePath}`),
-              )
-            }
-
-            const oldContent = yield* afs.readFileString(filePath)
+            const oldContent =
+              mode === "propose"
+                ? yield* SessionProposedFiles.readFileString(proposedFiles, afs, filePath).pipe(
+                    Effect.catch(() =>
+                      Effect.fail(new Error(`apply_patch verification failed: Failed to read file to update: ${filePath}`)),
+                    ),
+                  )
+                : yield* Effect.gen(function* () {
+                    const stats = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (!stats || stats.type === "Directory") {
+                      return yield* Effect.fail(
+                        new Error(`apply_patch verification failed: Failed to read file to update: ${filePath}`),
+                      )
+                    }
+                    return yield* afs.readFileString(filePath)
+                  })
             let newContent = oldContent
 
             // Apply the update chunks to get new content
             try {
-              const fileUpdate = Patch.deriveNewContentsFromChunks(filePath, hunk.chunks)
+              const fileUpdate = Patch.deriveNewContentsFromSource(filePath, oldContent, hunk.chunks)
               newContent = fileUpdate.content
             } catch (error) {
               return yield* Effect.fail(new Error(`apply_patch verification failed: ${error}`))
@@ -127,6 +165,33 @@ export const ApplyPatchTool = Tool.define(
             const movePath = hunk.move_path ? path.resolve(Instance.directory, hunk.move_path) : undefined
             yield* assertExternalDirectoryEffect(ctx, movePath)
 
+            if (mode === "propose") {
+              if (movePath) {
+                const source = SessionProposedFiles.normalizePath(filePath)
+                const target = SessionProposedFiles.normalizePath(movePath)
+                if (source !== target && (yield* SessionProposedFiles.exists(proposedFiles, afs, movePath))) {
+                  return yield* Effect.fail(
+                    new Error(`apply_patch verification failed: Target already exists for move: ${movePath}`),
+                  )
+                }
+                stagedOverlayChanges.push({
+                  type: "delete",
+                  filePath,
+                })
+                stagedOverlayChanges.push({
+                  type: "set",
+                  filePath: movePath,
+                  content: newContent,
+                })
+              } else {
+                stagedOverlayChanges.push({
+                  type: "set",
+                  filePath,
+                  content: newContent,
+                })
+              }
+            }
+
             fileChanges.push({
               filePath,
               oldContent,
@@ -143,17 +208,20 @@ export const ApplyPatchTool = Tool.define(
           }
 
           case "delete": {
-            const contentToDelete = yield* afs
-              .readFileString(filePath)
-              .pipe(
-                Effect.catch((error) =>
-                  Effect.fail(
-                    new Error(
-                      `apply_patch verification failed: ${error instanceof Error ? error.message : String(error)}`,
+            const contentToDelete =
+              mode === "propose"
+                ? yield* SessionProposedFiles.readFileString(proposedFiles, afs, filePath).pipe(
+                    Effect.catch((error) =>
+                      Effect.fail(new Error(`apply_patch verification failed: ${String(error)}`)),
                     ),
-                  ),
-                ),
-              )
+                  )
+                : yield* afs
+                    .readFileString(filePath)
+                    .pipe(
+                      Effect.catch((error) =>
+                        Effect.fail(new Error(`apply_patch verification failed: ${String(error)}`)),
+                      ),
+                    )
             const deleteDiff = trimDiff(createTwoFilesPatch(filePath, filePath, contentToDelete, ""))
 
             const deletions = contentToDelete.split("\n").length
@@ -167,6 +235,13 @@ export const ApplyPatchTool = Tool.define(
               additions: 0,
               deletions,
             })
+
+            if (mode === "propose") {
+              stagedOverlayChanges.push({
+                type: "delete",
+                filePath,
+              })
+            }
 
             totalDiff += deleteDiff + "\n"
             break
@@ -199,9 +274,19 @@ export const ApplyPatchTool = Tool.define(
       })
 
       // Apply the changes
+      if (mode === "propose") {
+        for (const staged of stagedOverlayChanges) {
+          if (staged.type === "delete") {
+            SessionProposedFiles.setDelete(proposedFiles!, staged.filePath)
+            continue
+          }
+          SessionProposedFiles.setFile(proposedFiles!, staged.filePath, staged.content)
+        }
+      }
+
       const updates: Array<{ file: string; event: "add" | "change" | "unlink" }> = []
 
-      for (const change of fileChanges) {
+      for (const change of mode === "propose" ? [] : fileChanges) {
         const edited = change.type === "delete" ? undefined : (change.movePath ?? change.filePath)
         switch (change.type) {
           case "add":
@@ -240,17 +325,17 @@ export const ApplyPatchTool = Tool.define(
       }
 
       // Publish file change events
-      for (const update of updates) {
+      for (const update of mode === "propose" ? [] : updates) {
         yield* bus.publish(FileWatcher.Event.Updated, update)
       }
 
       // Notify LSP of file changes and collect diagnostics
-      for (const change of fileChanges) {
+      for (const change of mode === "propose" ? [] : fileChanges) {
         if (change.type === "delete") continue
         const target = change.movePath ?? change.filePath
         yield* lsp.touchFile(target, true)
       }
-      const diagnostics = yield* lsp.diagnostics()
+      const diagnostics = mode === "propose" ? {} : yield* lsp.diagnostics()
 
       // Generate output summary
       const summaryLines = fileChanges.map((change) => {
@@ -266,6 +351,7 @@ export const ApplyPatchTool = Tool.define(
       let output = `Success. Updated the following files:\n${summaryLines.join("\n")}`
 
       for (const change of fileChanges) {
+        if (mode === "propose") continue
         if (change.type === "delete") continue
         const target = change.movePath ?? change.filePath
         const block = LSP.Diagnostic.report(target, diagnostics[AppFileSystem.normalizePath(target)] ?? [])
@@ -274,14 +360,57 @@ export const ApplyPatchTool = Tool.define(
         output += `\n\nLSP errors detected in ${rel}, please fix:\n${block}`
       }
 
+      const proposalFiles =
+        mode === "propose"
+          ? fileChanges.flatMap((change) => {
+              if (change.type === "delete") {
+                return [
+                  Proposal.deleteFile({
+                    filePath: change.filePath,
+                    diff: change.diff,
+                    additions: change.additions,
+                    deletions: change.deletions,
+                  }),
+                ]
+              }
+              if (change.type === "move") {
+                return [
+                  Proposal.deleteFile({
+                    filePath: change.filePath,
+                    diff: change.diff,
+                    additions: change.additions,
+                    deletions: change.deletions,
+                  }),
+                  Proposal.setFile({
+                    filePath: change.movePath!,
+                    newContent: change.newContent,
+                    diff: change.diff,
+                    additions: change.additions,
+                    deletions: change.deletions,
+                  }),
+                ]
+              }
+              return [
+                Proposal.setFile({
+                  filePath: change.filePath,
+                  newContent: change.newContent,
+                  diff: change.diff,
+                  additions: change.additions,
+                  deletions: change.deletions,
+                }),
+              ]
+            })
+          : undefined
+
       return {
-        title: output,
+        title: mode === "propose" ? "Proposed patch changes" : output,
         metadata: {
           diff: totalDiff,
           files,
           diagnostics,
+          ...(proposalFiles ? { proposal: Proposal.payload(proposalFiles) } : {}),
         },
-        output,
+        output: mode === "propose" ? `Success. Proposed updates for ${fileChanges.length} files.` : output,
       }
     })
 

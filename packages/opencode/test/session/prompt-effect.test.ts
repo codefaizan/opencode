@@ -511,6 +511,58 @@ it.live("glob tool keeps instance context during prompt runs", () =>
   ),
 )
 
+it.live("propose execution mode does not write disk and does not carry to next direct run", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({
+          title: "Propose mode",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        const target = path.join(dir, "propose-check.txt")
+        yield* Effect.promise(() => Bun.write(target, "disk"))
+
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          executionMode: "propose",
+          noReply: true,
+          parts: [{ type: "text", text: "propose write" }],
+        })
+        yield* llm.tool("write", { filePath: target, content: "overlay" })
+        yield* llm.text("done")
+        yield* prompt.loop({ sessionID: session.id, executionMode: "propose" })
+
+        expect(yield* Effect.promise(() => Bun.file(target).text())).toBe("disk")
+
+        const proposeMsgs = yield* MessageV2.filterCompactedEffect(session.id)
+        const proposeTool = proposeMsgs
+          .flatMap((msg) => msg.parts)
+          .find(
+            (part): part is CompletedToolPart =>
+              part.type === "tool" && part.tool === "write" && part.state.status === "completed",
+          )
+        expect(proposeTool?.state.metadata?.proposal?.mode).toBe("propose")
+
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "direct write" }],
+        })
+        yield* llm.tool("write", { filePath: target, content: "direct" })
+        yield* llm.text("done")
+        yield* prompt.loop({ sessionID: session.id })
+
+        expect(yield* Effect.promise(() => Bun.file(target).text())).toBe("direct")
+      }),
+    { git: true, config: providerCfg },
+  ),
+)
+
 it.live("loop continues when finish is stop but assistant has tool parts", () =>
   provideTmpdirServer(
     Effect.fnUntraced(function* ({ llm }) {
