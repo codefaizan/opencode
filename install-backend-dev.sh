@@ -30,7 +30,7 @@ Usage:
   bash install-backend-dev.sh [options]
 
 Options:
-  --repo <owner/repo>     GitHub repository (default: anomalyco/opencode)
+  --repo <owner/repo>     GitHub repository (default: codefaizan/opencode)
   --version <version>     Install a specific release version (eg. 1.4.9)
   --install-dir <path>    Install directory (default: ~/.opencode-dev/bin)
   --bin-name <name>       Installed command name (default: opencode-backend-dev)
@@ -44,12 +44,12 @@ Environment variables:
   OPENCODE_BACKEND_BIN_NAME
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/dev/install-backend-dev.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/dev/install-backend-dev.sh | bash -s -- --repo yourname/opencode --version 1.4.9
+  curl -fsSL https://raw.githubusercontent.com/codefaizan/opencode/dev/install-backend-dev.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/codefaizan/opencode/dev/install-backend-dev.sh | bash -s -- --repo yourname/opencode --version 1.4.9
 EOF
 }
 
-repo="${OPENCODE_BACKEND_REPO:-anomalyco/opencode}"
+repo="${OPENCODE_BACKEND_REPO:-codefaizan/opencode}"
 requested_version="${OPENCODE_BACKEND_VERSION:-${VERSION:-}}"
 install_dir="${OPENCODE_BACKEND_INSTALL_DIR:-$HOME/.opencode-dev/bin}"
 bin_name="${OPENCODE_BACKEND_BIN_NAME:-opencode-backend-dev}"
