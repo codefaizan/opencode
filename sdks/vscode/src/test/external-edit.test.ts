@@ -221,4 +221,54 @@ suite("external-edit", () => {
 
     await rm(filePath, { force: true })
   })
+
+  test("applyProposals calls arity-2 externalEdit once per file", async () => {
+    const firstPath = path.join(os.tmpdir(), `opencode-external-multi-1-${randomUUID()}.md`)
+    const secondPath = path.join(os.tmpdir(), `opencode-external-multi-2-${randomUUID()}.md`)
+    await writeFile(firstPath, "one-before\n", "utf8")
+    await writeFile(secondPath, "two-before\n", "utf8")
+
+    const targets: string[] = []
+
+    const response = {
+      externalEdit: async (target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
+        if (Array.isArray(target)) {
+          targets.push(...target.map((item) => item.toString()))
+        } else {
+          targets.push(target.toString())
+        }
+
+        await callback()
+        return "undo-stop-id"
+      },
+    } as unknown as vscode.ChatResponseStream
+
+    const result = await applyProposals(response, [
+      {
+        operation: "set",
+        file_path: firstPath,
+        uri: vscode.Uri.file(firstPath).toString(),
+        new_content: "one-after\n",
+      },
+      {
+        operation: "set",
+        file_path: secondPath,
+        uri: vscode.Uri.file(secondPath).toString(),
+        new_content: "two-after\n",
+      },
+    ])
+
+    const firstContent = await readFile(firstPath, "utf8")
+    const secondContent = await readFile(secondPath, "utf8")
+
+    assert.deepEqual(targets.sort(), [vscode.Uri.file(firstPath).toString(), vscode.Uri.file(secondPath).toString()].sort())
+    assert.equal(firstContent, "one-after\n")
+    assert.equal(secondContent, "two-after\n")
+    assert.equal(result?.method, "externalEdit")
+    assert.equal(result?.files, 2)
+    assert.equal(result?.skipped, 0)
+
+    await rm(firstPath, { force: true })
+    await rm(secondPath, { force: true })
+  })
 })

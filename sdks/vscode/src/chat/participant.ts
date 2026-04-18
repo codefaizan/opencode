@@ -7,7 +7,6 @@ import {
   readProposalPayload,
   resolveEffectiveProposalFiles,
   summarizeProposalFiles,
-  type ProposalFile,
 } from "./external-edit"
 import { OpencodeClient } from "./opencode-client"
 
@@ -120,6 +119,7 @@ export function registerOpencodeChatParticipant({ context, client, iconPath }: R
       }
 
       if (result.proposals.length > 0) {
+        const mergedProposals = mergeProposalFiles(result.proposals)
         console.log(
           "proposal preview:",
           result.proposals.slice(0, 3).map((proposal) => ({
@@ -132,7 +132,7 @@ export function registerOpencodeChatParticipant({ context, client, iconPath }: R
           })),
         )
 
-        const summary = summarizeProposalFiles(result.proposals)
+        const summary = summarizeProposalFiles(mergedProposals)
         const wantsNativeReview =
           executionMode === "propose" && resolveProposeApplyStrategySetting() === "nativeReview"
         const shouldUseNativeReview =
@@ -512,3 +512,4 @@ function previewValue(value: unknown) {
     content: asNonEmptyString(record["content"])?.slice(0, 120),
   }
 }
+

@@ -122,6 +122,7 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
                 response.markdown("_No assistant text was returned._");
             }
             if (result.proposals.length > 0) {
+                const mergedProposals = (0, external_edit_1.mergeProposalFiles)(result.proposals);
                 console.log("proposal preview:", result.proposals.slice(0, 3).map((proposal) => ({
                     operation: proposal.operation,
                     file_path: proposal.file_path,
@@ -130,7 +131,7 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
                     additions: proposal.additions,
                     deletions: proposal.deletions,
                 })));
-                const summary = (0, external_edit_1.summarizeProposalFiles)(result.proposals);
+                const summary = (0, external_edit_1.summarizeProposalFiles)(mergedProposals);
                 const wantsNativeReview = executionMode === "propose" && resolveProposeApplyStrategySetting() === "nativeReview";
                 const shouldUseNativeReview = wantsNativeReview &&
                     (chatMode.supportsExternalReview || (assumeExternalReviewWhenModeUnknown && !chatMode.name));
@@ -160,6 +161,7 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
                             }
                             else {
                                 response.progress(`Prepared ${applied.files} file edit${applied.files === 1 ? "" : "s"} for chat review${applied.skipped > 0 ? ` (${applied.skipped} no-op file proposal${applied.skipped === 1 ? "" : "s"} skipped)` : ""}. Review and accept/reject hunks in chat edit UI.`);
+                                response.markdown(renderProposalDeltaNote(mergedProposals));
                             }
                         }
                         if (!applied) {
@@ -451,5 +453,22 @@ function previewValue(value) {
         kind: asNonEmptyString(record["kind"]),
         content: asNonEmptyString(record["content"])?.slice(0, 120),
     };
+}
+function renderProposalDeltaNote(files) {
+    const lines = files.slice(0, 8).map((file) => {
+        const label = file.file_path.trim().length > 0 ? file.file_path : file.uri;
+        const additions = typeof file.additions === "number" ? file.additions : "?";
+        const deletions = typeof file.deletions === "number" ? file.deletions : "?";
+        return `- \`${label}\`: ${additions}+/${deletions}-`;
+    });
+    const extra = files.length > lines.length ? `\n- ...and ${files.length - lines.length} more file edit${files.length - lines.length === 1 ? "" : "s"}` : "";
+    return [
+        "Heads-up: chat UI **Edited** chips can occasionally differ from expected per-file deltas for external-edit tracked changes (including simple log-line additions).",
+        "Proposed per-file deltas:",
+        ...lines,
+        extra,
+    ]
+        .filter((line) => line.length > 0)
+        .join("\n");
 }
 //# sourceMappingURL=participant.js.map

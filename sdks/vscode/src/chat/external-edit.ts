@@ -115,15 +115,14 @@ export async function applyProposals(
   )
 
   if (externalEdit.length >= 2) {
-    await (externalEdit as unknown as (
-      target: vscode.Uri | vscode.Uri[],
-      callback: () => Thenable<unknown>,
-    ) => Thenable<string>)(
-      targets.length === 1 ? targets[0] : targets,
-      async () => {
-        await applyProposalsToFileSystem(effective.applicable)
-      },
-    )
+    for (const file of effective.applicable) {
+      await (externalEdit as unknown as (
+        target: vscode.Uri | vscode.Uri[],
+        callback: () => Thenable<unknown>,
+      ) => Thenable<string>)(toUri(file), async () => {
+        await applyProposalToFileSystem(file)
+      })
+    }
   } else {
     await (externalEdit as unknown as (edit: vscode.WorkspaceEdit) => void | Thenable<void>)(edit)
   }
@@ -206,8 +205,7 @@ export async function buildWorkspaceEdit(files: readonly ProposalFile[]) {
     }
 
     const document = await vscode.workspace.openTextDocument(uri)
-    const fullRange = new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length))
-    edit.replace(uri, fullRange, newContent)
+    applyMinimalReplaceEdit(edit, uri, document, newContent)
   }
 
   return edit
@@ -242,24 +240,76 @@ function proposalTargets(files: readonly ProposalFile[]) {
   return Array.from(unique.values())
 }
 
-async function applyProposalsToFileSystem(files: readonly ProposalFile[]) {
-  const encoder = new TextEncoder()
+async function applyProposalToFileSystem(file: ProposalFile) {
+  const uri = toUri(file)
 
-  for (const file of files) {
-    const uri = toUri(file)
+  if (file.operation === "delete") {
+    await vscode.workspace.fs.delete(uri, {
+      recursive: false,
+      useTrash: false,
+    })
+    return
+  }
 
-    if (file.operation === "delete") {
-      await vscode.workspace.fs.delete(uri, {
-        recursive: false,
-        useTrash: false,
-      })
-      continue
-    }
+  const newContent = file.new_content ?? ""
+  const edit = new vscode.WorkspaceEdit()
+  const exists = await fileExists(uri)
 
+  if (!exists) {
     const directory = vscode.Uri.file(path.dirname(uri.fsPath))
     await vscode.workspace.fs.createDirectory(directory)
-    await vscode.workspace.fs.writeFile(uri, encoder.encode(file.new_content ?? ""))
+    edit.createFile(uri, { ignoreIfExists: true })
+    edit.insert(uri, new vscode.Position(0, 0), newContent)
+  } else {
+    const document = await vscode.workspace.openTextDocument(uri)
+    applyMinimalReplaceEdit(edit, uri, document, newContent)
   }
+
+  const applied = await vscode.workspace.applyEdit(edit)
+  if (!applied) {
+    throw new Error(`OpenCode could not apply proposed changes to ${uri.fsPath}.`)
+  }
+
+  const document = await vscode.workspace.openTextDocument(uri)
+  const saved = await document.save()
+  if (!saved) {
+    throw new Error(`OpenCode could not save proposed changes to ${uri.fsPath}.`)
+  }
+}
+
+function applyMinimalReplaceEdit(
+  edit: vscode.WorkspaceEdit,
+  uri: vscode.Uri,
+  document: vscode.TextDocument,
+  newContent: string,
+) {
+  const current = document.getText()
+  if (current === newContent) return
+
+  const currentLength = current.length
+  const newLength = newContent.length
+
+  let prefixLength = 0
+  const sharedPrefixLimit = Math.min(currentLength, newLength)
+  while (prefixLength < sharedPrefixLimit && current.charCodeAt(prefixLength) === newContent.charCodeAt(prefixLength)) {
+    prefixLength += 1
+  }
+
+  let suffixLength = 0
+  const sharedSuffixLimit = Math.min(currentLength - prefixLength, newLength - prefixLength)
+  while (
+    suffixLength < sharedSuffixLimit &&
+    current.charCodeAt(currentLength - 1 - suffixLength) === newContent.charCodeAt(newLength - 1 - suffixLength)
+  ) {
+    suffixLength += 1
+  }
+
+  const currentStartOffset = prefixLength
+  const currentEndOffset = currentLength - suffixLength
+  const replacement = newContent.slice(prefixLength, newLength - suffixLength)
+
+  const range = new vscode.Range(document.positionAt(currentStartOffset), document.positionAt(currentEndOffset))
+  edit.replace(uri, range, replacement)
 }
 
 function fileExists(uri: vscode.Uri) {

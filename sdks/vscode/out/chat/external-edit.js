@@ -112,9 +112,11 @@ async function applyProposals(response, files) {
     const targets = proposalTargets(effective.applicable);
     console.log("proposal target uris:", targets.map((target) => target.toString()));
     if (externalEdit.length >= 2) {
-        await externalEdit(targets.length === 1 ? targets[0] : targets, async () => {
-            await applyProposalsToFileSystem(effective.applicable);
-        });
+        for (const file of effective.applicable) {
+            await externalEdit(toUri(file), async () => {
+                await applyProposalToFileSystem(file);
+            });
+        }
     }
     else {
         await externalEdit(edit);
@@ -182,8 +184,7 @@ async function buildWorkspaceEdit(files) {
             continue;
         }
         const document = await vscode.workspace.openTextDocument(uri);
-        const fullRange = new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length));
-        edit.replace(uri, fullRange, newContent);
+        applyMinimalReplaceEdit(edit, uri, document, newContent);
     }
     return edit;
 }
@@ -213,21 +214,60 @@ function proposalTargets(files) {
     });
     return Array.from(unique.values());
 }
-async function applyProposalsToFileSystem(files) {
-    const encoder = new TextEncoder();
-    for (const file of files) {
-        const uri = toUri(file);
-        if (file.operation === "delete") {
-            await vscode.workspace.fs.delete(uri, {
-                recursive: false,
-                useTrash: false,
-            });
-            continue;
-        }
+async function applyProposalToFileSystem(file) {
+    const uri = toUri(file);
+    if (file.operation === "delete") {
+        await vscode.workspace.fs.delete(uri, {
+            recursive: false,
+            useTrash: false,
+        });
+        return;
+    }
+    const newContent = file.new_content ?? "";
+    const edit = new vscode.WorkspaceEdit();
+    const exists = await fileExists(uri);
+    if (!exists) {
         const directory = vscode.Uri.file(path.dirname(uri.fsPath));
         await vscode.workspace.fs.createDirectory(directory);
-        await vscode.workspace.fs.writeFile(uri, encoder.encode(file.new_content ?? ""));
+        edit.createFile(uri, { ignoreIfExists: true });
+        edit.insert(uri, new vscode.Position(0, 0), newContent);
     }
+    else {
+        const document = await vscode.workspace.openTextDocument(uri);
+        applyMinimalReplaceEdit(edit, uri, document, newContent);
+    }
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+        throw new Error(`OpenCode could not apply proposed changes to ${uri.fsPath}.`);
+    }
+    const document = await vscode.workspace.openTextDocument(uri);
+    const saved = await document.save();
+    if (!saved) {
+        throw new Error(`OpenCode could not save proposed changes to ${uri.fsPath}.`);
+    }
+}
+function applyMinimalReplaceEdit(edit, uri, document, newContent) {
+    const current = document.getText();
+    if (current === newContent)
+        return;
+    const currentLength = current.length;
+    const newLength = newContent.length;
+    let prefixLength = 0;
+    const sharedPrefixLimit = Math.min(currentLength, newLength);
+    while (prefixLength < sharedPrefixLimit && current.charCodeAt(prefixLength) === newContent.charCodeAt(prefixLength)) {
+        prefixLength += 1;
+    }
+    let suffixLength = 0;
+    const sharedSuffixLimit = Math.min(currentLength - prefixLength, newLength - prefixLength);
+    while (suffixLength < sharedSuffixLimit &&
+        current.charCodeAt(currentLength - 1 - suffixLength) === newContent.charCodeAt(newLength - 1 - suffixLength)) {
+        suffixLength += 1;
+    }
+    const currentStartOffset = prefixLength;
+    const currentEndOffset = currentLength - suffixLength;
+    const replacement = newContent.slice(prefixLength, newLength - suffixLength);
+    const range = new vscode.Range(document.positionAt(currentStartOffset), document.positionAt(currentEndOffset));
+    edit.replace(uri, range, replacement);
 }
 function fileExists(uri) {
     return vscode.workspace.fs.stat(uri).then(() => true, () => false);

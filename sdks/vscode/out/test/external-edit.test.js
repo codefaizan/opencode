@@ -219,5 +219,48 @@ suite("external-edit", () => {
         assert.equal(result?.skipped, 0);
         await (0, promises_1.rm)(filePath, { force: true });
     });
+    test("applyProposals calls arity-2 externalEdit once per file", async () => {
+        const firstPath = path.join(os.tmpdir(), `opencode-external-multi-1-${(0, node_crypto_1.randomUUID)()}.md`);
+        const secondPath = path.join(os.tmpdir(), `opencode-external-multi-2-${(0, node_crypto_1.randomUUID)()}.md`);
+        await (0, promises_1.writeFile)(firstPath, "one-before\n", "utf8");
+        await (0, promises_1.writeFile)(secondPath, "two-before\n", "utf8");
+        const targets = [];
+        const response = {
+            externalEdit: async (target, callback) => {
+                if (Array.isArray(target)) {
+                    targets.push(...target.map((item) => item.toString()));
+                }
+                else {
+                    targets.push(target.toString());
+                }
+                await callback();
+                return "undo-stop-id";
+            },
+        };
+        const result = await (0, external_edit_1.applyProposals)(response, [
+            {
+                operation: "set",
+                file_path: firstPath,
+                uri: vscode.Uri.file(firstPath).toString(),
+                new_content: "one-after\n",
+            },
+            {
+                operation: "set",
+                file_path: secondPath,
+                uri: vscode.Uri.file(secondPath).toString(),
+                new_content: "two-after\n",
+            },
+        ]);
+        const firstContent = await (0, promises_1.readFile)(firstPath, "utf8");
+        const secondContent = await (0, promises_1.readFile)(secondPath, "utf8");
+        assert.deepEqual(targets.sort(), [vscode.Uri.file(firstPath).toString(), vscode.Uri.file(secondPath).toString()].sort());
+        assert.equal(firstContent, "one-after\n");
+        assert.equal(secondContent, "two-after\n");
+        assert.equal(result?.method, "externalEdit");
+        assert.equal(result?.files, 2);
+        assert.equal(result?.skipped, 0);
+        await (0, promises_1.rm)(firstPath, { force: true });
+        await (0, promises_1.rm)(secondPath, { force: true });
+    });
 });
 //# sourceMappingURL=external-edit.test.js.map
