@@ -34,6 +34,11 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 const assert = __importStar(require("node:assert"));
+const os = __importStar(require("node:os"));
+const path = __importStar(require("node:path"));
+const node_crypto_1 = require("node:crypto");
+const promises_1 = require("node:fs/promises");
+const vscode = __importStar(require("vscode"));
 const external_edit_1 = require("../chat/external-edit");
 suite("external-edit", () => {
     test("readProposalPayload accepts valid propose payload", () => {
@@ -147,6 +152,72 @@ suite("external-edit", () => {
         assert.ok(called);
         assert.equal(result?.method, "externalEdit");
         assert.equal(result?.files, 1);
+        assert.equal(result?.skipped, 0);
+    });
+    test("resolveEffectiveProposalFiles skips unchanged set proposals", async () => {
+        const filePath = path.join(os.tmpdir(), `opencode-noop-${(0, node_crypto_1.randomUUID)()}.md`);
+        await (0, promises_1.writeFile)(filePath, "hello world\n", "utf8");
+        const result = await (0, external_edit_1.resolveEffectiveProposalFiles)([
+            {
+                operation: "set",
+                file_path: filePath,
+                uri: vscode.Uri.file(filePath).toString(),
+                new_content: "hello world\n",
+            },
+        ]);
+        assert.equal(result.applicable.length, 0);
+        assert.equal(result.skipped.length, 1);
+        await (0, promises_1.rm)(filePath, { force: true });
+    });
+    test("applyProposals does not call externalEdit for no-op proposals", async () => {
+        const filePath = path.join(os.tmpdir(), `opencode-noop-apply-${(0, node_crypto_1.randomUUID)()}.md`);
+        await (0, promises_1.writeFile)(filePath, "same\n", "utf8");
+        let called = false;
+        const response = {
+            externalEdit: (_edit) => {
+                called = true;
+            },
+        };
+        const result = await (0, external_edit_1.applyProposals)(response, [
+            {
+                operation: "set",
+                file_path: filePath,
+                uri: vscode.Uri.file(filePath).toString(),
+                new_content: "same\n",
+            },
+        ]);
+        assert.equal(called, false);
+        assert.equal(result?.method, "externalEdit");
+        assert.equal(result?.files, 0);
+        assert.equal(result?.skipped, 1);
+        await (0, promises_1.rm)(filePath, { force: true });
+    });
+    test("applyProposals writes changes in arity-2 externalEdit callback", async () => {
+        const filePath = path.join(os.tmpdir(), `opencode-external-arity2-${(0, node_crypto_1.randomUUID)()}.md`);
+        await (0, promises_1.writeFile)(filePath, "before\n", "utf8");
+        let called = false;
+        const response = {
+            externalEdit: async (_target, callback) => {
+                called = true;
+                await callback();
+                return "undo-stop-id";
+            },
+        };
+        const result = await (0, external_edit_1.applyProposals)(response, [
+            {
+                operation: "set",
+                file_path: filePath,
+                uri: vscode.Uri.file(filePath).toString(),
+                new_content: "after\n",
+            },
+        ]);
+        const content = await (0, promises_1.readFile)(filePath, "utf8");
+        assert.equal(called, true);
+        assert.equal(content, "after\n");
+        assert.equal(result?.method, "externalEdit");
+        assert.equal(result?.files, 1);
+        assert.equal(result?.skipped, 0);
+        await (0, promises_1.rm)(filePath, { force: true });
     });
 });
 //# sourceMappingURL=external-edit.test.js.map

@@ -29,6 +29,9 @@
     "onChatParticipant:opencode.chat",
     "onCommand:opencode.applyProposedEdits"
   ],
+  "enabledApiProposals": [
+    "chatParticipantAdditions"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -51,6 +54,10 @@
       {
         "command": "opencode.addFilepathToTerminal",
         "title": "Add Filepath to Terminal"
+      },
+      {
+        "command": "opencode.selectChatModel",
+        "title": "opencode: Select Chat Model"
       },
       {
         "command": "opencode.applyProposedEdits",
@@ -105,11 +112,51 @@
         "win": "ctrl+alt+K",
         "linux": "ctrl+alt+K"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "opencode",
+      "properties": {
+        "opencode.chatModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional OpenCode model override in `provider/model` format (for example: `opencode/gpt-5-nano`). When set, this is used instead of the VS Code chat model picker selection.",
+          "scope": "resource"
+        },
+        "opencode.executionMode": {
+          "type": "string",
+          "enum": [
+            "propose",
+            "direct"
+          ],
+          "default": "propose",
+          "markdownDescription": "Controls chat edit behavior. `propose` returns proposed edits. `direct` applies changes to files immediately during agent execution.",
+          "scope": "resource"
+        },
+        "opencode.proposeApplyStrategy": {
+          "type": "string",
+          "enum": [
+            "nativeReview",
+            "manualApply"
+          ],
+          "default": "nativeReview",
+          "markdownDescription": "Controls how proposed edits are surfaced when `opencode.executionMode` is `propose`. `nativeReview` uses VS Code chat edit review UI when available. `manualApply` always shows an explicit **Apply proposed edits** button and never auto-attaches native review edits.",
+          "scope": "resource"
+        },
+        "opencode.assumeExternalReviewWhenModeUnknown": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Advanced fallback for VS Code builds where chat mode metadata is unavailable to extensions. When enabled, OpenCode will still attempt native external review in `propose` + `nativeReview` even if mode cannot be detected. In Extension Development Host (F5), this fallback is attempted by default when this setting is not explicitly configured. ⚠️ In non-editing contexts, this may apply edits directly instead of showing per-hunk review.",
+          "scope": "resource"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "bun run package",
+    "build": "bun run compile",
     "compile": "bun run check-types && bun run lint && node esbuild.js",
+    "proposed-api:download": "npx @vscode/dts dev",
+    "proposed-api:sync": "bun run proposed-api:download && node script/sync-proposed-dts.mjs",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "bun run check-types && bun run lint && node esbuild.js --production",
@@ -121,6 +168,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@vscode/dts": "^0.4.1",
     "@types/vscode": "^1.102.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",

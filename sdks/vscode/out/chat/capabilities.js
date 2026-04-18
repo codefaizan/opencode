@@ -41,10 +41,12 @@ function supportsChatParticipantApi() {
     return typeof vscode.chat?.createChatParticipant === "function";
 }
 function getExternalEditHandler(response) {
+    if (!response)
+        return;
     const stream = response;
     if (typeof stream.externalEdit !== "function")
         return;
-    return stream.externalEdit;
+    return stream.externalEdit.bind(stream);
 }
 function externalEditCapabilityMessage(response) {
     if (getExternalEditHandler(response)) {

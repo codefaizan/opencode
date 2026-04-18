@@ -39,6 +39,7 @@ const vscode = __importStar(require("vscode"));
 const opencode_client_1 = require("./chat/opencode-client");
 const participant_1 = require("./chat/participant");
 const TERMINAL_NAME = "opencode";
+const SELECT_MODEL_COMMAND = "opencode.selectChatModel";
 function activate(context) {
     const iconPath = {
         light: vscode.Uri.file(context.asAbsolutePath("images/button-dark.svg")),
@@ -79,7 +80,47 @@ function activate(context) {
             terminal.show();
         }
     });
-    context.subscriptions.push(openNewTerminalDisposable, openTerminalDisposable, addFilepathDisposable);
+    const selectModelDisposable = vscode.commands.registerCommand(SELECT_MODEL_COMMAND, async () => {
+        const directory = resolveWorkspaceDirectory();
+        const result = await chatClient
+            .listModels(directory)
+            .then((models) => ({ models }))
+            .catch((error) => ({ error }));
+        if ("error" in result) {
+            void vscode.window.showErrorMessage(errorMessage(result.error));
+            return;
+        }
+        if (result.models.length === 0) {
+            void vscode.window.showWarningMessage("OpenCode returned no models. Verify your provider setup and try again.");
+            return;
+        }
+        const configuredModel = configuredChatModel();
+        const pick = await vscode.window.showQuickPick([
+            {
+                label: "Use VS Code model picker",
+                detail: "Clear OpenCode model override",
+                model: undefined,
+            },
+            ...result.models.map((model) => ({
+                label: model,
+                detail: model === configuredModel ? "Currently selected" : undefined,
+                model,
+            })),
+        ], {
+            title: "Select OpenCode Chat Model",
+            placeHolder: "Choose a model from `opencode models`",
+        });
+        if (!pick)
+            return;
+        await vscode.workspace
+            .getConfiguration("opencode")
+            .update(participant_1.OPENCODE_CHAT_MODEL_SETTING, pick.model, settingsTarget());
+        const message = pick.model
+            ? `OpenCode chat model set to ${pick.model}`
+            : "OpenCode chat model override cleared. VS Code picker model will be used.";
+        void vscode.window.showInformationMessage(message);
+    });
+    context.subscriptions.push(openNewTerminalDisposable, openTerminalDisposable, addFilepathDisposable, selectModelDisposable);
     async function openTerminal() {
         // Create a new terminal in split screen
         const port = Math.floor(Math.random() * (65535 - 16384 + 1)) + 16384;
@@ -158,6 +199,32 @@ function activate(context) {
             }
         }
         return filepathWithAt;
+    }
+    function configuredChatModel() {
+        const model = vscode.workspace.getConfiguration("opencode").get(participant_1.OPENCODE_CHAT_MODEL_SETTING);
+        if (!model)
+            return;
+        return model.trim() || undefined;
+    }
+    function settingsTarget() {
+        if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+            return vscode.ConfigurationTarget.Workspace;
+        }
+        return vscode.ConfigurationTarget.Global;
+    }
+    function resolveWorkspaceDirectory() {
+        const activeEditorUri = vscode.window.activeTextEditor?.document.uri;
+        if (activeEditorUri) {
+            const activeFolder = vscode.workspace.getWorkspaceFolder(activeEditorUri);
+            if (activeFolder)
+                return activeFolder.uri.fsPath;
+        }
+        return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    }
+    function errorMessage(error) {
+        if (error instanceof Error && error.message.length > 0)
+            return error.message;
+        return "Failed to load OpenCode models";
     }
 }
 // This method is called when your extension is deactivated

@@ -25,6 +25,12 @@ export type ProposalPayload = {
 export type ApplyProposalResult = {
   method: "externalEdit"
   files: number
+  skipped: number
+}
+
+export type EffectiveProposalFiles = {
+  applicable: ProposalFile[]
+  skipped: ProposalFile[]
 }
 
 export function readProposalPayload(value: unknown) {
@@ -77,7 +83,7 @@ export function mergeProposalFiles(files: readonly ProposalFile[]) {
 }
 
 export async function applyProposals(
-  response: vscode.ChatResponseStream,
+  response: vscode.ChatResponseStream | undefined,
   files: readonly ProposalFile[],
 ): Promise<ApplyProposalResult | undefined> {
   if (files.length === 0) return
@@ -86,12 +92,92 @@ export async function applyProposals(
   const externalEdit = getExternalEditHandler(response)
   if (!externalEdit) return
 
-  const edit = await buildWorkspaceEdit(merged)
-  await externalEdit(edit)
+  const effective = await resolveEffectiveProposalFiles(merged)
+  console.log("proposal effective summary:", {
+    proposed: merged.length,
+    applicable: effective.applicable.length,
+    skipped: effective.skipped.length,
+  })
+
+  if (effective.applicable.length === 0) {
+    return {
+      method: "externalEdit",
+      files: 0,
+      skipped: effective.skipped.length,
+    }
+  }
+
+  const edit = await buildWorkspaceEdit(effective.applicable)
+  const targets = proposalTargets(effective.applicable)
+  console.log(
+    "proposal target uris:",
+    targets.map((target) => target.toString()),
+  )
+
+  if (externalEdit.length >= 2) {
+    await (externalEdit as unknown as (
+      target: vscode.Uri | vscode.Uri[],
+      callback: () => Thenable<unknown>,
+    ) => Thenable<string>)(
+      targets.length === 1 ? targets[0] : targets,
+      async () => {
+        await applyProposalsToFileSystem(effective.applicable)
+      },
+    )
+  } else {
+    await (externalEdit as unknown as (edit: vscode.WorkspaceEdit) => void | Thenable<void>)(edit)
+  }
 
   return {
     method: "externalEdit",
-    files: merged.length,
+    files: effective.applicable.length,
+    skipped: effective.skipped.length,
+  }
+}
+
+export async function resolveEffectiveProposalFiles(files: readonly ProposalFile[]): Promise<EffectiveProposalFiles> {
+  const applicable: ProposalFile[] = []
+  const skipped: ProposalFile[] = []
+
+  for (const file of files) {
+    const uri = toUri(file)
+    const exists = await fileExists(uri)
+
+    if (file.operation === "delete") {
+      if (!exists) {
+        skipped.push(file)
+        continue
+      }
+
+      applicable.push(file)
+      continue
+    }
+
+    const newContent = file.new_content ?? ""
+
+    if (!exists) {
+      applicable.push({
+        ...file,
+        new_content: newContent,
+      })
+      continue
+    }
+
+    const document = await vscode.workspace.openTextDocument(uri)
+    if (document.getText() === newContent) {
+      skipped.push(file)
+      continue
+    }
+
+    applicable.push({
+      ...file,
+      new_content: newContent,
+    })
+  }
+
+  return {
+    applicable,
+    skipped,
   }
 }
 
@@ -136,8 +222,44 @@ export function summarizeProposalFiles(files: readonly ProposalFile[]) {
 }
 
 function toUri(file: ProposalFile) {
-  if (file.uri.startsWith("file://")) return vscode.Uri.parse(file.uri)
+  const fromPath = resolveUriFromFilePath(file.file_path)
+  if (fromPath) return fromPath
+
+  if (file.uri.startsWith("file://")) {
+    const parsed = vscode.Uri.parse(file.uri)
+    if (parsed.scheme === "file" && parsed.fsPath.length > 0) return parsed
+  }
+
   return vscode.Uri.file(file.file_path)
+}
+
+function proposalTargets(files: readonly ProposalFile[]) {
+  const unique = new Map<string, vscode.Uri>()
+  files.forEach((file) => {
+    const uri = toUri(file)
+    unique.set(uri.toString(), uri)
+  })
+  return Array.from(unique.values())
+}
+
+async function applyProposalsToFileSystem(files: readonly ProposalFile[]) {
+  const encoder = new TextEncoder()
+
+  for (const file of files) {
+    const uri = toUri(file)
+
+    if (file.operation === "delete") {
+      await vscode.workspace.fs.delete(uri, {
+        recursive: false,
+        useTrash: false,
+      })
+      continue
+    }
+
+    const directory = vscode.Uri.file(path.dirname(uri.fsPath))
+    await vscode.workspace.fs.createDirectory(directory)
+    await vscode.workspace.fs.writeFile(uri, encoder.encode(file.new_content ?? ""))
+  }
 }
 
 function fileExists(uri: vscode.Uri) {
@@ -149,4 +271,13 @@ function fileExists(uri: vscode.Uri) {
 
 function normalizePath(filePath: string) {
   return path.normalize(filePath)
+}
+
+function resolveUriFromFilePath(filePath: string) {
+  if (path.isAbsolute(filePath)) return vscode.Uri.file(filePath)
+
+  const folder = vscode.workspace.workspaceFolders?.[0]
+  if (!folder) return
+
+  return vscode.Uri.file(path.join(folder.uri.fsPath, filePath))
 }

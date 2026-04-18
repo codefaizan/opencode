@@ -27,8 +27,9 @@ class OpencodeClient {
             proposalsByPath: new Map(),
             assistantText: "",
         };
-        options.onProgress?.("Sending request to OpenCode in propose mode...");
-        await this.promptAsync(baseUrl, sessionID, options.prompt, options.directory);
+        const modeLabel = options.executionMode ?? "propose";
+        options.onProgress?.(`Sending request to OpenCode in ${modeLabel} mode${formatModelSuffix(options.model)}...`);
+        await this.promptAsync(baseUrl, sessionID, options.prompt, options.directory, options.model, options.executionMode);
         let done = false;
         try {
             for await (const event of this.globalEvents(baseUrl, abortController.signal)) {
@@ -46,7 +47,7 @@ class OpencodeClient {
                     break;
                 }
                 if (eventType === "session.error") {
-                    const message = firstString(properties?.["error"], properties?.["message"]) ?? "Session failed";
+                    const message = extractSessionErrorMessage(properties) ?? "Session failed";
                     throw new Error(message);
                 }
                 if (eventType === "message.updated") {
@@ -80,6 +81,14 @@ class OpencodeClient {
             text: streamState.assistantText,
             proposals: Array.from(streamState.proposalsByPath.values()),
         };
+    }
+    async listModels(directory) {
+        const output = await execOpencodeCommand(["models"], directory);
+        return output
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .filter((line, index, all) => all.indexOf(line) === index);
     }
     captureAssistantMessage(properties, state) {
         const info = toRecord(properties?.["info"]);
@@ -220,12 +229,13 @@ class OpencodeClient {
             throw new Error("OpenCode session response was missing an id");
         return { id };
     }
-    async promptAsync(baseUrl, sessionID, prompt, directory) {
+    async promptAsync(baseUrl, sessionID, prompt, directory, model, executionMode) {
         const query = new URLSearchParams();
         if (directory)
             query.set("directory", directory);
         const body = {
-            executionMode: "propose",
+            executionMode: executionMode ?? "propose",
+            model,
             parts: [
                 {
                     type: "text",
@@ -242,8 +252,9 @@ class OpencodeClient {
         });
         if (response.status === 204)
             return;
-        const message = await response.text();
-        throw new Error(`Failed to send prompt to OpenCode (${response.status}): ${message}`);
+        const raw = await response.text();
+        const details = parseErrorMessage(raw);
+        throw new Error(`Failed to send prompt to OpenCode (${response.status}): ${details}`);
     }
     async ensureServer(directory) {
         if (this.server && this.server.directory === directory) {
@@ -375,6 +386,35 @@ function asString(value) {
 function firstString(...values) {
     return values.find((value) => typeof value === "string" && value.length > 0);
 }
+function formatModelSuffix(model) {
+    if (!model)
+        return "";
+    return ` with ${model.providerID}/${model.modelID}`;
+}
+function parseErrorMessage(raw) {
+    if (!raw)
+        return "Unknown error";
+    const parsed = safeJsonParse(raw);
+    if (!parsed)
+        return raw;
+    return (extractSessionErrorMessage(toRecord(parsed)) ??
+        firstString(toRecord(parsed)?.["error"], toRecord(parsed)?.["message"]) ??
+        raw);
+}
+function extractSessionErrorMessage(properties) {
+    const direct = firstString(properties?.["message"]);
+    if (direct)
+        return direct;
+    const error = properties?.["error"];
+    if (typeof error === "string")
+        return error;
+    const errorRecord = toRecord(error);
+    if (!errorRecord)
+        return;
+    const nested = toRecord(errorRecord["error"]);
+    const message = firstString(errorRecord["message"], errorRecord["code"], nested?.["message"], nested?.["code"], nested?.["type"]) ?? undefined;
+    return message;
+}
 function processEnv() {
     return typeof process !== "undefined" ? process.env : {};
 }
@@ -399,6 +439,35 @@ function pickAvailablePort() {
                 }
                 resolve(port);
             });
+        });
+    });
+}
+function execOpencodeCommand(args, directory) {
+    return new Promise((resolve, reject) => {
+        const process = (0, node_child_process_1.spawn)("opencode", args, {
+            cwd: directory,
+            env: {
+                ...processEnv(),
+                OPENCODE_CALLER: "vscode",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        process.stdout.on("data", (chunk) => {
+            stdout += chunk.toString("utf8");
+        });
+        process.stderr.on("data", (chunk) => {
+            stderr += chunk.toString("utf8");
+        });
+        process.on("error", reject);
+        process.on("close", (code) => {
+            if (code === 0) {
+                resolve(stdout);
+                return;
+            }
+            const details = stderr.trim() || stdout.trim() || `exit code ${String(code)}`;
+            reject(new Error(`Failed to run \`opencode ${args.join(" ")}\`: ${details}`));
         });
     });
 }

@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.readProposalPayload = readProposalPayload;
 exports.mergeProposalFiles = mergeProposalFiles;
 exports.applyProposals = applyProposals;
+exports.resolveEffectiveProposalFiles = resolveEffectiveProposalFiles;
 exports.buildWorkspaceEdit = buildWorkspaceEdit;
 exports.summarizeProposalFiles = summarizeProposalFiles;
 const path = __importStar(require("node:path"));
@@ -94,11 +95,71 @@ async function applyProposals(response, files) {
     const externalEdit = (0, capabilities_1.getExternalEditHandler)(response);
     if (!externalEdit)
         return;
-    const edit = await buildWorkspaceEdit(merged);
-    await externalEdit(edit);
+    const effective = await resolveEffectiveProposalFiles(merged);
+    console.log("proposal effective summary:", {
+        proposed: merged.length,
+        applicable: effective.applicable.length,
+        skipped: effective.skipped.length,
+    });
+    if (effective.applicable.length === 0) {
+        return {
+            method: "externalEdit",
+            files: 0,
+            skipped: effective.skipped.length,
+        };
+    }
+    const edit = await buildWorkspaceEdit(effective.applicable);
+    const targets = proposalTargets(effective.applicable);
+    console.log("proposal target uris:", targets.map((target) => target.toString()));
+    if (externalEdit.length >= 2) {
+        await externalEdit(targets.length === 1 ? targets[0] : targets, async () => {
+            await applyProposalsToFileSystem(effective.applicable);
+        });
+    }
+    else {
+        await externalEdit(edit);
+    }
     return {
         method: "externalEdit",
-        files: merged.length,
+        files: effective.applicable.length,
+        skipped: effective.skipped.length,
+    };
+}
+async function resolveEffectiveProposalFiles(files) {
+    const applicable = [];
+    const skipped = [];
+    for (const file of files) {
+        const uri = toUri(file);
+        const exists = await fileExists(uri);
+        if (file.operation === "delete") {
+            if (!exists) {
+                skipped.push(file);
+                continue;
+            }
+            applicable.push(file);
+            continue;
+        }
+        const newContent = file.new_content ?? "";
+        if (!exists) {
+            applicable.push({
+                ...file,
+                new_content: newContent,
+            });
+            continue;
+        }
+        const document = await vscode.workspace.openTextDocument(uri);
+        if (document.getText() === newContent) {
+            skipped.push(file);
+            continue;
+        }
+        applicable.push({
+            ...file,
+            new_content: newContent,
+        });
+    }
+    return {
+        applicable,
+        skipped,
     };
 }
 async function buildWorkspaceEdit(files) {
@@ -134,14 +195,52 @@ function summarizeProposalFiles(files) {
     };
 }
 function toUri(file) {
-    if (file.uri.startsWith("file://"))
-        return vscode.Uri.parse(file.uri);
+    const fromPath = resolveUriFromFilePath(file.file_path);
+    if (fromPath)
+        return fromPath;
+    if (file.uri.startsWith("file://")) {
+        const parsed = vscode.Uri.parse(file.uri);
+        if (parsed.scheme === "file" && parsed.fsPath.length > 0)
+            return parsed;
+    }
     return vscode.Uri.file(file.file_path);
+}
+function proposalTargets(files) {
+    const unique = new Map();
+    files.forEach((file) => {
+        const uri = toUri(file);
+        unique.set(uri.toString(), uri);
+    });
+    return Array.from(unique.values());
+}
+async function applyProposalsToFileSystem(files) {
+    const encoder = new TextEncoder();
+    for (const file of files) {
+        const uri = toUri(file);
+        if (file.operation === "delete") {
+            await vscode.workspace.fs.delete(uri, {
+                recursive: false,
+                useTrash: false,
+            });
+            continue;
+        }
+        const directory = vscode.Uri.file(path.dirname(uri.fsPath));
+        await vscode.workspace.fs.createDirectory(directory);
+        await vscode.workspace.fs.writeFile(uri, encoder.encode(file.new_content ?? ""));
+    }
 }
 function fileExists(uri) {
     return vscode.workspace.fs.stat(uri).then(() => true, () => false);
 }
 function normalizePath(filePath) {
     return path.normalize(filePath);
+}
+function resolveUriFromFilePath(filePath) {
+    if (path.isAbsolute(filePath))
+        return vscode.Uri.file(filePath);
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder)
+        return;
+    return vscode.Uri.file(path.join(folder.uri.fsPath, filePath));
 }
 //# sourceMappingURL=external-edit.js.map

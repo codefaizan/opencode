@@ -14,7 +14,11 @@ type PromptPartInput = {
 
 type PromptAsyncBody = {
   parts: PromptPartInput[]
-  executionMode: "propose"
+  executionMode: "direct" | "propose"
+  model?: {
+    providerID: string
+    modelID: string
+  }
 }
 
 type GlobalEvent = {
@@ -45,6 +49,11 @@ export type ProposePromptOptions = {
   directory?: string
   prompt: string
   sessionID?: string
+  executionMode?: "direct" | "propose"
+  model?: {
+    providerID: string
+    modelID: string
+  }
   token: vscode.CancellationToken
   onProgress?: (message: string) => void
   onText?: (chunk: string) => void
@@ -80,8 +89,16 @@ export class OpencodeClient implements vscode.Disposable {
       assistantText: "",
     }
 
-    options.onProgress?.("Sending request to OpenCode in propose mode...")
-    await this.promptAsync(baseUrl, sessionID, options.prompt, options.directory)
+    const modeLabel = options.executionMode ?? "propose"
+    options.onProgress?.(`Sending request to OpenCode in ${modeLabel} mode${formatModelSuffix(options.model)}...`)
+    await this.promptAsync(
+      baseUrl,
+      sessionID,
+      options.prompt,
+      options.directory,
+      options.model,
+      options.executionMode,
+    )
 
     let done = false
 
@@ -104,7 +121,7 @@ export class OpencodeClient implements vscode.Disposable {
         }
 
         if (eventType === "session.error") {
-          const message = firstString(properties?.["error"], properties?.["message"]) ?? "Session failed"
+          const message = extractSessionErrorMessage(properties) ?? "Session failed"
           throw new Error(message)
         }
 
@@ -142,6 +159,15 @@ export class OpencodeClient implements vscode.Disposable {
       text: streamState.assistantText,
       proposals: Array.from(streamState.proposalsByPath.values()),
     }
+  }
+
+  async listModels(directory?: string) {
+    const output = await execOpencodeCommand(["models"], directory)
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line): line is string => line.length > 0)
+      .filter((line, index, all) => all.indexOf(line) === index)
   }
 
   private captureAssistantMessage(properties: Record<string, unknown> | undefined, state: StreamState) {
@@ -309,12 +335,20 @@ export class OpencodeClient implements vscode.Disposable {
     return { id }
   }
 
-  private async promptAsync(baseUrl: string, sessionID: string, prompt: string, directory?: string) {
+  private async promptAsync(
+    baseUrl: string,
+    sessionID: string,
+    prompt: string,
+    directory?: string,
+    model?: { providerID: string; modelID: string },
+    executionMode?: "direct" | "propose",
+  ) {
     const query = new URLSearchParams()
     if (directory) query.set("directory", directory)
 
     const body: PromptAsyncBody = {
-      executionMode: "propose",
+      executionMode: executionMode ?? "propose",
+      model,
       parts: [
         {
           type: "text",
@@ -333,8 +367,9 @@ export class OpencodeClient implements vscode.Disposable {
 
     if (response.status === 204) return
 
-    const message = await response.text()
-    throw new Error(`Failed to send prompt to OpenCode (${response.status}): ${message}`)
+    const raw = await response.text()
+    const details = parseErrorMessage(raw)
+    throw new Error(`Failed to send prompt to OpenCode (${response.status}): ${details}`)
   }
 
   private async ensureServer(directory?: string) {
@@ -491,6 +526,47 @@ function firstString(...values: unknown[]) {
   return values.find((value): value is string => typeof value === "string" && value.length > 0)
 }
 
+function formatModelSuffix(model: { providerID: string; modelID: string } | undefined) {
+  if (!model) return ""
+  return ` with ${model.providerID}/${model.modelID}`
+}
+
+function parseErrorMessage(raw: string) {
+  if (!raw) return "Unknown error"
+
+  const parsed = safeJsonParse(raw)
+  if (!parsed) return raw
+
+  return (
+    extractSessionErrorMessage(toRecord(parsed)) ??
+    firstString(toRecord(parsed)?.["error"], toRecord(parsed)?.["message"]) ??
+    raw
+  )
+}
+
+function extractSessionErrorMessage(properties: Record<string, unknown> | undefined) {
+  const direct = firstString(properties?.["message"])
+  if (direct) return direct
+
+  const error = properties?.["error"]
+  if (typeof error === "string") return error
+
+  const errorRecord = toRecord(error)
+  if (!errorRecord) return
+
+  const nested = toRecord(errorRecord["error"])
+  const message =
+    firstString(
+      errorRecord["message"],
+      errorRecord["code"],
+      nested?.["message"],
+      nested?.["code"],
+      nested?.["type"],
+    ) ?? undefined
+
+  return message
+}
+
 function processEnv() {
   return typeof process !== "undefined" ? process.env : {}
 }
@@ -520,6 +596,42 @@ function pickAvailablePort() {
         }
         resolve(port)
       })
+    })
+  })
+}
+
+function execOpencodeCommand(args: string[], directory?: string) {
+  return new Promise<string>((resolve, reject) => {
+    const process = spawn("opencode", args, {
+      cwd: directory,
+      env: {
+        ...processEnv(),
+        OPENCODE_CALLER: "vscode",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    let stdout = ""
+    let stderr = ""
+
+    process.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8")
+    })
+
+    process.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8")
+    })
+
+    process.on("error", reject)
+
+    process.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout)
+        return
+      }
+
+      const details = stderr.trim() || stdout.trim() || `exit code ${String(code)}`
+      reject(new Error(`Failed to run \`opencode ${args.join(" ")}\`: ${details}`))
     })
   })
 }

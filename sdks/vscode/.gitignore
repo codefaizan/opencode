@@ -1,1 +1,4 @@
 dist
+vscode.d.ts
+vscode.proposed.*.d.ts
+src/types/vscode.proposed.*.d.ts
