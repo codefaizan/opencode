@@ -1,11 +1,21 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.OpencodeClient = void 0;
+exports.shouldRevertSessionForSync = shouldRevertSessionForSync;
 const node_child_process_1 = require("node:child_process");
 const node_net_1 = require("node:net");
 const external_edit_1 = require("./external-edit");
 const SERVER_BOOT_TIMEOUT_MS = 15_000;
 const SERVER_POLL_INTERVAL_MS = 250;
+function shouldRevertSessionForSync(options) {
+    if (!options.sessionID)
+        return false;
+    if (!options.anchorAssistantMessageID)
+        return false;
+    if (!options.latestAssistantMessageID)
+        return false;
+    return options.anchorAssistantMessageID !== options.latestAssistantMessageID;
+}
 class OpencodeClient {
     output;
     server;
@@ -17,7 +27,15 @@ class OpencodeClient {
     }
     async runProposePrompt(options) {
         const baseUrl = await this.ensureServer(options.directory);
-        const sessionID = options.sessionID ?? (await this.createSession(baseUrl, options.directory)).id;
+        const sessionID = options.sessionID
+            ? await this.resolveSynchronizedSession({
+                baseUrl,
+                directory: options.directory,
+                sessionID: options.sessionID,
+                anchorAssistantMessageID: options.anchorAssistantMessageID,
+                onProgress: options.onProgress,
+            })
+            : (await this.createSession(baseUrl, options.directory)).id;
         const abortController = new AbortController();
         const tokenListener = options.token.onCancellationRequested(() => abortController.abort());
         const streamState = {
@@ -78,9 +96,25 @@ class OpencodeClient {
         });
         return {
             sessionID,
+            assistantMessageID: fallback.assistantMessageID,
             text: streamState.assistantText,
             proposals: Array.from(streamState.proposalsByPath.values()),
         };
+    }
+    async resolveSynchronizedSession(input) {
+        if (!input.anchorAssistantMessageID)
+            return input.sessionID;
+        const latest = await this.fetchLatestAssistantMessage(input.baseUrl, input.sessionID, input.directory);
+        if (!shouldRevertSessionForSync({
+            sessionID: input.sessionID,
+            anchorAssistantMessageID: input.anchorAssistantMessageID,
+            latestAssistantMessageID: latest.assistantMessageID,
+        })) {
+            return input.sessionID;
+        }
+        input.onProgress?.("Detected resend from an earlier turn; syncing by reverting the current session timeline...");
+        await this.revertSession(input.baseUrl, input.sessionID, input.anchorAssistantMessageID, input.directory);
+        return input.sessionID;
     }
     async listModels(directory) {
         const output = await execOpencodeCommand(["models"], directory);
@@ -159,6 +193,7 @@ class OpencodeClient {
         const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionID)}/message?${query.toString()}`);
         if (!response.ok) {
             return {
+                assistantMessageID: undefined,
                 text: "",
                 proposals: [],
             };
@@ -166,6 +201,7 @@ class OpencodeClient {
         const data = await response.json();
         if (!Array.isArray(data)) {
             return {
+                assistantMessageID: undefined,
                 text: "",
                 proposals: [],
             };
@@ -177,11 +213,13 @@ class OpencodeClient {
         const latest = assistants.at(-1);
         if (!latest) {
             return {
+                assistantMessageID: undefined,
                 text: "",
                 proposals: [],
             };
         }
         const parts = toArray(toRecord(latest)?.["parts"]);
+        const assistantMessageID = asString(toRecord(toRecord(latest)?.["info"])?.["id"]);
         const text = parts
             .filter((part) => toRecord(part)?.["type"] === "text")
             .map((part) => asString(toRecord(part)?.["text"]) ?? "")
@@ -205,9 +243,25 @@ class OpencodeClient {
             return acc;
         }, new Map());
         return {
+            assistantMessageID,
             text,
             proposals: Array.from(proposals.values()),
         };
+    }
+    async revertSession(baseUrl, sessionID, messageID, directory) {
+        const query = new URLSearchParams();
+        if (directory)
+            query.set("directory", directory);
+        const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionID)}/revert?${query.toString()}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ messageID }),
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to revert OpenCode session (${response.status})`);
+        }
     }
     async createSession(baseUrl, directory) {
         const query = new URLSearchParams();

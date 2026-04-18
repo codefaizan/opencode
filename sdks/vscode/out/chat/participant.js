@@ -74,7 +74,9 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
     const participant = vscode.chat.createChatParticipant(exports.CHAT_PARTICIPANT_ID, async (request, chatContext, response, token) => {
         const prompt = buildPrompt(request);
         const directory = resolveWorkspaceDirectory();
-        const sessionID = isNewSessionCommand(request.command) ? undefined : resolveSessionID(chatContext.history);
+        const sessionContext = isNewSessionCommand(request.command)
+            ? undefined
+            : resolveSessionContext(chatContext.history);
         const model = resolveConfiguredModel() ?? resolveSelectedModel(request.model);
         const executionMode = resolveExecutionModeSetting();
         const chatMode = resolveChatModeInfo(request);
@@ -111,7 +113,8 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
             const result = await client.runProposePrompt({
                 directory,
                 prompt,
-                sessionID,
+                sessionID: sessionContext?.sessionID,
+                anchorAssistantMessageID: sessionContext?.assistantMessageID,
                 model,
                 executionMode,
                 token,
@@ -161,7 +164,6 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
                             }
                             else {
                                 response.progress(`Prepared ${applied.files} file edit${applied.files === 1 ? "" : "s"} for chat review${applied.skipped > 0 ? ` (${applied.skipped} no-op file proposal${applied.skipped === 1 ? "" : "s"} skipped)` : ""}. Review and accept/reject hunks in chat edit UI.`);
-                                response.markdown(renderProposalDeltaNote(mergedProposals));
                             }
                         }
                         if (!applied) {
@@ -188,6 +190,7 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
             return {
                 metadata: {
                     sessionID: result.sessionID,
+                    assistantMessageID: result.assistantMessageID,
                     proposals: result.proposals.length,
                 },
             };
@@ -209,14 +212,20 @@ function registerOpencodeChatParticipant({ context, client, iconPath }) {
 function isNewSessionCommand(command) {
     return command === "new";
 }
-function resolveSessionID(history) {
+function resolveSessionContext(history) {
     const responses = history.filter((turn) => "result" in turn);
     const latestWithSession = responses.reverse().find((turn) => {
         const sessionID = turn.result.metadata?.["sessionID"];
         return typeof sessionID === "string" && sessionID.length > 0;
     });
-    const value = latestWithSession?.result.metadata?.["sessionID"];
-    return typeof value === "string" ? value : undefined;
+    const sessionID = latestWithSession?.result.metadata?.["sessionID"];
+    if (typeof sessionID !== "string" || sessionID.length === 0)
+        return;
+    const assistantMessageID = latestWithSession?.result.metadata?.["assistantMessageID"];
+    return {
+        sessionID,
+        assistantMessageID: typeof assistantMessageID === "string" && assistantMessageID.length > 0 ? assistantMessageID : undefined,
+    };
 }
 function buildPrompt(request) {
     const references = request.references
@@ -453,22 +462,5 @@ function previewValue(value) {
         kind: asNonEmptyString(record["kind"]),
         content: asNonEmptyString(record["content"])?.slice(0, 120),
     };
-}
-function renderProposalDeltaNote(files) {
-    const lines = files.slice(0, 8).map((file) => {
-        const label = file.file_path.trim().length > 0 ? file.file_path : file.uri;
-        const additions = typeof file.additions === "number" ? file.additions : "?";
-        const deletions = typeof file.deletions === "number" ? file.deletions : "?";
-        return `- \`${label}\`: ${additions}+/${deletions}-`;
-    });
-    const extra = files.length > lines.length ? `\n- ...and ${files.length - lines.length} more file edit${files.length - lines.length === 1 ? "" : "s"}` : "";
-    return [
-        "Heads-up: chat UI **Edited** chips can occasionally differ from expected per-file deltas for external-edit tracked changes (including simple log-line additions).",
-        "Proposed per-file deltas:",
-        ...lines,
-        extra,
-    ]
-        .filter((line) => line.length > 0)
-        .join("\n");
 }
 //# sourceMappingURL=participant.js.map

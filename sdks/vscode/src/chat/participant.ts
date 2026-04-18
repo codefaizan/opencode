@@ -67,7 +67,9 @@ export function registerOpencodeChatParticipant({ context, client, iconPath }: R
   const participant = vscode.chat.createChatParticipant(CHAT_PARTICIPANT_ID, async (request, chatContext, response, token) => {
     const prompt = buildPrompt(request)
     const directory = resolveWorkspaceDirectory()
-    const sessionID = isNewSessionCommand(request.command) ? undefined : resolveSessionID(chatContext.history)
+    const sessionContext = isNewSessionCommand(request.command)
+      ? undefined
+      : resolveSessionContext(chatContext.history)
     const model = resolveConfiguredModel() ?? resolveSelectedModel(request.model)
     const executionMode = resolveExecutionModeSetting()
     const chatMode = resolveChatModeInfo(request)
@@ -106,7 +108,8 @@ export function registerOpencodeChatParticipant({ context, client, iconPath }: R
       const result = await client.runProposePrompt({
         directory,
         prompt,
-        sessionID,
+        sessionID: sessionContext?.sessionID,
+        anchorAssistantMessageID: sessionContext?.assistantMessageID,
         model,
         executionMode,
         token,
@@ -206,6 +209,7 @@ export function registerOpencodeChatParticipant({ context, client, iconPath }: R
       return {
         metadata: {
           sessionID: result.sessionID,
+          assistantMessageID: result.assistantMessageID,
           proposals: result.proposals.length,
         },
       } satisfies vscode.ChatResult
@@ -232,15 +236,26 @@ function isNewSessionCommand(command: string | undefined) {
   return command === "new"
 }
 
-function resolveSessionID(history: readonly (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]) {
+type SessionContext = {
+  sessionID: string
+  assistantMessageID?: string
+}
+
+function resolveSessionContext(history: readonly (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]) {
   const responses = history.filter((turn): turn is vscode.ChatResponseTurn => "result" in turn)
   const latestWithSession = responses.reverse().find((turn) => {
     const sessionID = turn.result.metadata?.["sessionID"]
     return typeof sessionID === "string" && sessionID.length > 0
   })
 
-  const value = latestWithSession?.result.metadata?.["sessionID"]
-  return typeof value === "string" ? value : undefined
+  const sessionID = latestWithSession?.result.metadata?.["sessionID"]
+  if (typeof sessionID !== "string" || sessionID.length === 0) return
+
+  const assistantMessageID = latestWithSession?.result.metadata?.["assistantMessageID"]
+  return {
+    sessionID,
+    assistantMessageID: typeof assistantMessageID === "string" && assistantMessageID.length > 0 ? assistantMessageID : undefined,
+  } satisfies SessionContext
 }
 
 function buildPrompt(request: vscode.ChatRequest) {

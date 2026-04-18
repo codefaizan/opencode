@@ -49,6 +49,7 @@ export type ProposePromptOptions = {
   directory?: string
   prompt: string
   sessionID?: string
+  anchorAssistantMessageID?: string
   executionMode?: "direct" | "propose"
   model?: {
     providerID: string
@@ -61,8 +62,20 @@ export type ProposePromptOptions = {
 
 export type ProposePromptResult = {
   sessionID: string
+  assistantMessageID?: string
   text: string
   proposals: ProposalFile[]
+}
+
+export function shouldRevertSessionForSync(options: {
+  sessionID?: string
+  anchorAssistantMessageID?: string
+  latestAssistantMessageID?: string
+}) {
+  if (!options.sessionID) return false
+  if (!options.anchorAssistantMessageID) return false
+  if (!options.latestAssistantMessageID) return false
+  return options.anchorAssistantMessageID !== options.latestAssistantMessageID
 }
 
 export class OpencodeClient implements vscode.Disposable {
@@ -76,7 +89,15 @@ export class OpencodeClient implements vscode.Disposable {
 
   async runProposePrompt(options: ProposePromptOptions): Promise<ProposePromptResult> {
     const baseUrl = await this.ensureServer(options.directory)
-    const sessionID = options.sessionID ?? (await this.createSession(baseUrl, options.directory)).id
+    const sessionID = options.sessionID
+      ? await this.resolveSynchronizedSession({
+          baseUrl,
+          directory: options.directory,
+          sessionID: options.sessionID,
+          anchorAssistantMessageID: options.anchorAssistantMessageID,
+          onProgress: options.onProgress,
+        })
+      : (await this.createSession(baseUrl, options.directory)).id
 
     const abortController = new AbortController()
     const tokenListener = options.token.onCancellationRequested(() => abortController.abort())
@@ -156,9 +177,35 @@ export class OpencodeClient implements vscode.Disposable {
 
     return {
       sessionID,
+      assistantMessageID: fallback.assistantMessageID,
       text: streamState.assistantText,
       proposals: Array.from(streamState.proposalsByPath.values()),
     }
+  }
+
+  private async resolveSynchronizedSession(input: {
+    baseUrl: string
+    directory?: string
+    sessionID: string
+    anchorAssistantMessageID?: string
+    onProgress?: (message: string) => void
+  }) {
+    if (!input.anchorAssistantMessageID) return input.sessionID
+
+    const latest = await this.fetchLatestAssistantMessage(input.baseUrl, input.sessionID, input.directory)
+    if (
+      !shouldRevertSessionForSync({
+        sessionID: input.sessionID,
+        anchorAssistantMessageID: input.anchorAssistantMessageID,
+        latestAssistantMessageID: latest.assistantMessageID,
+      })
+    ) {
+      return input.sessionID
+    }
+
+    input.onProgress?.("Detected resend from an earlier turn; syncing by reverting the current session timeline...")
+    await this.revertSession(input.baseUrl, input.sessionID, input.anchorAssistantMessageID, input.directory)
+    return input.sessionID
   }
 
   async listModels(directory?: string) {
@@ -253,6 +300,7 @@ export class OpencodeClient implements vscode.Disposable {
     const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionID)}/message?${query.toString()}`)
     if (!response.ok) {
       return {
+        assistantMessageID: undefined,
         text: "",
         proposals: [] as ProposalFile[],
       }
@@ -261,6 +309,7 @@ export class OpencodeClient implements vscode.Disposable {
     const data = await response.json()
     if (!Array.isArray(data)) {
       return {
+        assistantMessageID: undefined,
         text: "",
         proposals: [] as ProposalFile[],
       }
@@ -274,12 +323,14 @@ export class OpencodeClient implements vscode.Disposable {
     const latest = assistants.at(-1)
     if (!latest) {
       return {
+        assistantMessageID: undefined,
         text: "",
         proposals: [] as ProposalFile[],
       }
     }
 
     const parts = toArray(toRecord(latest)?.["parts"])
+    const assistantMessageID = asString(toRecord(toRecord(latest)?.["info"])?.["id"])
 
     const text = parts
       .filter((part) => toRecord(part)?.["type"] === "text")
@@ -306,8 +357,26 @@ export class OpencodeClient implements vscode.Disposable {
       }, new Map<string, ProposalFile>())
 
     return {
+      assistantMessageID,
       text,
       proposals: Array.from(proposals.values()),
+    }
+  }
+
+  private async revertSession(baseUrl: string, sessionID: string, messageID: string, directory?: string) {
+    const query = new URLSearchParams()
+    if (directory) query.set("directory", directory)
+
+    const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionID)}/revert?${query.toString()}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ messageID }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to revert OpenCode session (${response.status})`)
     }
   }
 
