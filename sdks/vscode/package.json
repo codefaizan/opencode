@@ -147,6 +147,12 @@
           "default": false,
           "markdownDescription": "Advanced fallback for VS Code builds where chat mode metadata is unavailable to extensions. When enabled, OpenCode will still attempt native external review in `propose` + `nativeReview` even if mode cannot be detected. In Extension Development Host (F5), this fallback is attempted by default when this setting is not explicitly configured. ⚠️ In non-editing contexts, this may apply edits directly instead of showing per-hunk review.",
           "scope": "resource"
+        },
+        "opencode.binaryPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional absolute path to the OpenCode binary to run. When set, the extension uses this path instead of `opencode` from PATH.",
+          "scope": "resource"
         }
       }
     }

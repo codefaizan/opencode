@@ -4,6 +4,7 @@ import { OPENCODE_CHAT_MODEL_SETTING, registerOpencodeChatParticipant } from "./
 
 const TERMINAL_NAME = "opencode"
 const SELECT_MODEL_COMMAND = "opencode.selectChatModel"
+const OPENCODE_BINARY_PATH_SETTING = "binaryPath"
 
 export function activate(context: vscode.ExtensionContext) {
   const iconPath = {
@@ -122,7 +123,8 @@ export function activate(context: vscode.ExtensionContext) {
     })
 
     terminal.show()
-    terminal.sendText(`opencode --port ${port}`)
+    const opencodeCommand = resolveOpencodeCommand()
+    terminal.sendText(`${quoteForShell(opencodeCommand)} --port ${port}`)
 
     const fileRef = getActiveFile()
     if (!fileRef) {
@@ -217,6 +219,19 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  }
+
+  function resolveOpencodeCommand() {
+    const configured = vscode.workspace.getConfiguration("opencode").get<string>(OPENCODE_BINARY_PATH_SETTING)
+    if (!configured) return "opencode"
+
+    const trimmed = configured.trim()
+    return trimmed.length > 0 ? trimmed : "opencode"
+  }
+
+  function quoteForShell(command: string) {
+    if (/^[A-Za-z0-9_./\\:-]+$/.test(command)) return command
+    return `"${command.replace(/"/g, '\\"')}"`
   }
 
   function errorMessage(error: unknown) {

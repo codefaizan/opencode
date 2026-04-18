@@ -44,6 +44,7 @@ type ServerState = {
 
 const SERVER_BOOT_TIMEOUT_MS = 15_000
 const SERVER_POLL_INTERVAL_MS = 250
+const OPENCODE_BINARY_PATH_SETTING = "binaryPath"
 
 export type ProposePromptOptions = {
   directory?: string
@@ -80,10 +81,17 @@ export function shouldRevertSessionForSync(options: {
 
 export class OpencodeClient implements vscode.Disposable {
   private server?: ServerState
+  private readonly configSubscription: vscode.Disposable
 
-  constructor(private readonly output: vscode.OutputChannel) {}
+  constructor(private readonly output: vscode.OutputChannel) {
+    this.configSubscription = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration(`opencode.${OPENCODE_BINARY_PATH_SETTING}`)) return
+      this.stopServer()
+    })
+  }
 
   dispose() {
+    this.configSubscription.dispose()
     this.stopServer()
   }
 
@@ -449,7 +457,7 @@ export class OpencodeClient implements vscode.Disposable {
     }
 
     const port = await pickAvailablePort()
-    const process = spawn("opencode", ["serve", "--port", String(port)], {
+    const process = spawn(resolveOpencodeCommand(), ["serve", "--port", String(port)], {
       cwd: directory,
       env: {
         ...processEnv(),
@@ -475,7 +483,7 @@ export class OpencodeClient implements vscode.Disposable {
     const started = await this.waitForServer(port, process)
     if (!started) {
       this.stopServer()
-      throw new Error("Unable to start OpenCode headless server. Verify `opencode` is installed and available in PATH.")
+      throw new Error("Unable to start OpenCode headless server. Verify OpenCode is installed and configure `opencode.binaryPath` if needed.")
     }
 
     this.output.appendLine(`OpenCode server ready on ${this.baseUrl(port)}`)
@@ -671,7 +679,8 @@ function pickAvailablePort() {
 
 function execOpencodeCommand(args: string[], directory?: string) {
   return new Promise<string>((resolve, reject) => {
-    const process = spawn("opencode", args, {
+    const command = resolveOpencodeCommand()
+    const process = spawn(command, args, {
       cwd: directory,
       env: {
         ...processEnv(),
@@ -700,7 +709,15 @@ function execOpencodeCommand(args: string[], directory?: string) {
       }
 
       const details = stderr.trim() || stdout.trim() || `exit code ${String(code)}`
-      reject(new Error(`Failed to run \`opencode ${args.join(" ")}\`: ${details}`))
+      reject(new Error(`Failed to run \`${command} ${args.join(" ")}\`: ${details}`))
     })
   })
+}
+
+function resolveOpencodeCommand() {
+  const configured = vscode.workspace.getConfiguration("opencode").get<string>(OPENCODE_BINARY_PATH_SETTING)
+  if (!configured) return "opencode"
+
+  const trimmed = configured.trim()
+  return trimmed.length > 0 ? trimmed : "opencode"
 }

@@ -33,7 +33,7 @@ Options:
   --repo <owner/repo>     GitHub repository (default: codefaizan/opencode)
   --version <version>     Install a specific release version (eg. 1.4.9)
   --install-dir <path>    Install directory (default: ~/.opencode-dev/bin)
-  --bin-name <name>       Installed command name (default: opencode-backend-dev)
+  --bin-name <name>       Installed command name (default: opencode-dev)
   --no-modify-path        Don't modify shell rc files
   -h, --help              Show help
 
@@ -52,7 +52,7 @@ EOF
 repo="${OPENCODE_BACKEND_REPO:-codefaizan/opencode}"
 requested_version="${OPENCODE_BACKEND_VERSION:-${VERSION:-}}"
 install_dir="${OPENCODE_BACKEND_INSTALL_DIR:-$HOME/.opencode-dev/bin}"
-bin_name="${OPENCODE_BACKEND_BIN_NAME:-opencode-backend-dev}"
+bin_name="${OPENCODE_BACKEND_BIN_NAME:-opencode-dev}"
 modify_path=true
 
 while [[ $# -gt 0 ]]; do
@@ -223,12 +223,17 @@ else
     unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
 fi
 
-if [[ ! -f "$tmp_dir/opencode" ]]; then
-    print_message error "Downloaded archive did not contain expected binary: opencode"
-    exit 1
+extracted_binary="$tmp_dir/opencode"
+if [[ "$os" == "windows" && -f "$tmp_dir/opencode.exe" ]]; then
+  extracted_binary="$tmp_dir/opencode.exe"
 fi
 
-mv "$tmp_dir/opencode" "$install_dir/$bin_name"
+if [[ ! -f "$extracted_binary" ]]; then
+  print_message error "Downloaded archive did not contain expected binary: opencode or opencode.exe"
+  exit 1
+fi
+
+mv "$extracted_binary" "$install_dir/$bin_name"
 chmod 755 "$install_dir/$bin_name"
 rm -rf "$tmp_dir"
 
