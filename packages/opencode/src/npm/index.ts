@@ -1,6 +1,7 @@
 export * as Npm from "."
 
 import path from "path"
+import npa from "npm-package-arg"
 import semver from "semver"
 import { Effect, Schema, Context, Layer, Option, FileSystem } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
@@ -25,7 +26,12 @@ export interface Interface {
   readonly add: (pkg: string) => Effect.Effect<EntryPoint, InstallFailedError | EffectFlock.LockError>
   readonly install: (
     dir: string,
-    input?: { add: string[] },
+    input?: {
+      add: {
+        name: string
+        version?: string
+      }[]
+    },
   ) => Effect.Effect<void, EffectFlock.LockError | InstallFailedError>
   readonly outdated: (pkg: string, cachedVersion: string) => Effect.Effect<boolean>
   readonly which: (pkg: string) => Effect.Effect<Option.Option<string>>
@@ -130,6 +136,17 @@ export const layer = Layer.effect(
 
     const add = Effect.fn("Npm.add")(function* (pkg: string) {
       const dir = directory(pkg)
+      const name = (() => {
+        try {
+          return npa(pkg).name ?? pkg
+        } catch {
+          return pkg
+        }
+      })()
+
+      if (yield* afs.existsSafe(dir)) {
+        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
+      }
 
       const tree = yield* reify({ dir, add: [pkg] })
       const first = tree.edgesOut.values().next().value?.to
@@ -137,20 +154,25 @@ export const layer = Layer.effect(
       return resolveEntryPoint(first.name, first.path)
     }, Effect.scoped)
 
-    const install = Effect.fn("Npm.install")(function* (dir: string, input?: { add: string[] }) {
+    const install: Interface["install"] = Effect.fn("Npm.install")(function* (dir, input) {
       const canWrite = yield* afs.access(dir, { writable: true }).pipe(
         Effect.as(true),
         Effect.orElseSucceed(() => false),
       )
       if (!canWrite) return
 
-      yield* Effect.gen(function* () {
-        const nodeModulesExists = yield* afs.existsSafe(path.join(dir, "node_modules"))
-        if (!nodeModulesExists) {
-          yield* reify({ add: input?.add, dir })
-          return
-        }
-      }).pipe(Effect.withSpan("Npm.checkNodeModules"))
+      const add = input?.add.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@")) ?? []
+      if (
+        yield* Effect.gen(function* () {
+          const nodeModulesExists = yield* afs.existsSafe(path.join(dir, "node_modules"))
+          if (!nodeModulesExists) {
+            yield* reify({ add, dir })
+            return true
+          }
+          return false
+        }).pipe(Effect.withSpan("Npm.checkNodeModules"))
+      )
+        return
 
       yield* Effect.gen(function* () {
         const pkg = yield* afs.readJson(path.join(dir, "package.json")).pipe(Effect.orElseSucceed(() => ({})))
@@ -163,7 +185,7 @@ export const layer = Layer.effect(
           ...Object.keys(pkgAny?.devDependencies || {}),
           ...Object.keys(pkgAny?.peerDependencies || {}),
           ...Object.keys(pkgAny?.optionalDependencies || {}),
-          ...(input?.add || []),
+          ...(input?.add || []).map((pkg) => pkg.name),
         ])
 
         const root = lockAny?.packages?.[""] || {}
@@ -176,7 +198,7 @@ export const layer = Layer.effect(
 
         for (const name of declared) {
           if (!locked.has(name)) {
-            yield* reify({ dir, add: input?.add })
+            yield* reify({ dir, add })
             return
           }
         }
