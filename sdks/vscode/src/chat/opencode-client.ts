@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process"
 import { createServer } from "node:net"
 import * as vscode from "vscode"
-import { readProposalPayload, type ProposalFile } from "./external-edit"
 
 type SessionInfo = {
   id: string
@@ -14,7 +13,6 @@ type PromptPartInput = {
 
 type PromptAsyncBody = {
   parts: PromptPartInput[]
-  executionMode: "direct" | "propose"
   model?: {
     providerID: string
     modelID: string
@@ -32,7 +30,6 @@ type StreamState = {
   assistantMessageIDs: Set<string>
   toolCallStatus: Set<string>
   textByPartID: Map<string, string>
-  proposalsByPath: Map<string, ProposalFile>
   assistantText: string
 }
 
@@ -46,12 +43,11 @@ const SERVER_BOOT_TIMEOUT_MS = 15_000
 const SERVER_POLL_INTERVAL_MS = 250
 const OPENCODE_BINARY_PATH_SETTING = "binaryPath"
 
-export type ProposePromptOptions = {
+export type PromptOptions = {
   directory?: string
   prompt: string
   sessionID?: string
   anchorAssistantMessageID?: string
-  executionMode?: "direct" | "propose"
   model?: {
     providerID: string
     modelID: string
@@ -59,13 +55,39 @@ export type ProposePromptOptions = {
   token: vscode.CancellationToken
   onProgress?: (message: string) => void
   onText?: (chunk: string) => void
+  onPermissionAsk?: (request: PermissionRequest, actions: PermissionActions) => Promise<void> | void
 }
 
-export type ProposePromptResult = {
+export type PermissionRequest = {
+  id: string
+  sessionID: string
+  permission: string
+  patterns: string[]
+  metadata: Record<string, unknown>
+  always: string[]
+}
+
+export type PermissionActions = {
+  approve: (mode?: "once" | "always") => Promise<void>
+  reject: (message?: string) => Promise<void>
+}
+
+export type EditFile = {
+  operation: "set" | "delete"
+  file_path: string
+  uri: string
+  new_content?: string
+  additions?: number
+  deletions?: number
+}
+
+export type PromptResult = {
   sessionID: string
   assistantMessageID?: string
   text: string
-  proposals: ProposalFile[]
+  metadata: {
+    files?: EditFile[]
+  }
 }
 
 export function shouldRevertSessionForSync(options: {
@@ -95,7 +117,7 @@ export class OpencodeClient implements vscode.Disposable {
     this.stopServer()
   }
 
-  async runProposePrompt(options: ProposePromptOptions): Promise<ProposePromptResult> {
+  async runPrompt(options: PromptOptions): Promise<PromptResult> {
     const baseUrl = await this.ensureServer(options.directory)
     const sessionID = options.sessionID
       ? await this.resolveSynchronizedSession({
@@ -114,22 +136,20 @@ export class OpencodeClient implements vscode.Disposable {
       assistantMessageIDs: new Set<string>(),
       toolCallStatus: new Set<string>(),
       textByPartID: new Map<string, string>(),
-      proposalsByPath: new Map<string, ProposalFile>(),
       assistantText: "",
     }
 
-    const modeLabel = options.executionMode ?? "propose"
-    options.onProgress?.(`Sending request to OpenCode in ${modeLabel} mode${formatModelSuffix(options.model)}...`)
+    options.onProgress?.(`Sending request to OpenCode${formatModelSuffix(options.model)}...`)
     await this.promptAsync(
       baseUrl,
       sessionID,
       options.prompt,
       options.directory,
       options.model,
-      options.executionMode,
     )
 
     let done = false
+    const handledPermissionRequests = new Set<string>()
 
     try {
       for await (const event of this.globalEvents(baseUrl, abortController.signal)) {
@@ -143,6 +163,25 @@ export class OpencodeClient implements vscode.Disposable {
         const eventSessionID = sessionIDFromProperties(properties)
 
         if (!eventType || eventSessionID !== sessionID) continue
+
+        if (eventType === "permission.asked") {
+          const request = permissionRequestFromProperties(properties)
+          if (!request || handledPermissionRequests.has(request.id)) continue
+          handledPermissionRequests.add(request.id)
+
+          const actions: PermissionActions = {
+            approve: (mode = "once") => this.replyPermission(baseUrl, request.id, mode, options.directory),
+            reject: (message) => this.replyPermission(baseUrl, request.id, "reject", options.directory, message),
+          }
+
+          if (options.onPermissionAsk) {
+            await options.onPermissionAsk(request, actions)
+            continue
+          }
+
+          await actions.approve("once")
+          continue
+        }
 
         if (eventType === "session.idle") {
           done = true
@@ -179,15 +218,13 @@ export class OpencodeClient implements vscode.Disposable {
       streamState.assistantText = fallback.text
     }
 
-    fallback.proposals.forEach((file) => {
-      streamState.proposalsByPath.set(file.file_path, file)
-    })
-
     return {
       sessionID,
       assistantMessageID: fallback.assistantMessageID,
       text: streamState.assistantText,
-      proposals: Array.from(streamState.proposalsByPath.values()),
+      metadata: {
+        files: fallback.files,
+      },
     }
   }
 
@@ -239,7 +276,7 @@ export class OpencodeClient implements vscode.Disposable {
   private captureMessagePart(
     properties: Record<string, unknown> | undefined,
     state: StreamState,
-    options: ProposePromptOptions,
+    options: PromptOptions,
   ) {
     const part = toRecord(properties?.["part"])
     if (!part) return
@@ -284,20 +321,6 @@ export class OpencodeClient implements vscode.Disposable {
     }
 
     if (status !== "completed") return
-
-    const stateMetadata = toRecord(toolState?.["metadata"])
-    const partMetadata = toRecord(part["metadata"])
-
-    const proposal =
-      readProposalPayload(stateMetadata?.["proposal"]) ??
-      readProposalPayload(partMetadata?.["proposal"]) ??
-      undefined
-
-    if (!proposal) return
-
-    proposal.files.forEach((file) => {
-      state.proposalsByPath.set(file.file_path, file)
-    })
   }
 
   private async fetchLatestAssistantMessage(baseUrl: string, sessionID: string, directory?: string) {
@@ -310,7 +333,7 @@ export class OpencodeClient implements vscode.Disposable {
       return {
         assistantMessageID: undefined,
         text: "",
-        proposals: [] as ProposalFile[],
+        files: [] as EditFile[],
       }
     }
 
@@ -319,7 +342,7 @@ export class OpencodeClient implements vscode.Disposable {
       return {
         assistantMessageID: undefined,
         text: "",
-        proposals: [] as ProposalFile[],
+        files: [] as EditFile[],
       }
     }
 
@@ -333,7 +356,7 @@ export class OpencodeClient implements vscode.Disposable {
       return {
         assistantMessageID: undefined,
         text: "",
-        proposals: [] as ProposalFile[],
+        files: [] as EditFile[],
       }
     }
 
@@ -345,29 +368,38 @@ export class OpencodeClient implements vscode.Disposable {
       .map((part) => asString(toRecord(part)?.["text"]) ?? "")
       .join("")
 
-    const proposals = parts
-      .flatMap((part) => {
-        const typedPart = toRecord(part)
-        if (!typedPart || typedPart["type"] !== "tool") return []
+    const editedFiles: EditFile[] = []
 
-        const toolState = toRecord(typedPart["state"])
-        if (toolState?.["status"] !== "completed") return []
+    for (const part of parts) {
+      const typedPart = toRecord(part)
+      if (!typedPart || typedPart["type"] !== "tool") continue
 
-        const metadata = toRecord(toolState["metadata"])
-        const proposal = readProposalPayload(metadata?.["proposal"])
-        if (!proposal) return []
+      const toolState = toRecord(typedPart["state"])
+      if (toolState?.["status"] !== "completed") continue
 
-        return proposal.files
-      })
-      .reduce((acc, file) => {
-        acc.set(file.file_path, file)
-        return acc
-      }, new Map<string, ProposalFile>())
+      const metadata = toRecord(toolState["metadata"])
+      const edited = metadata?.["editedFiles"]
+      if (Array.isArray(edited)) {
+        for (const file of edited) {
+          const f = file as Record<string, unknown>
+          if (typeof f["filePath"] === "string") {
+            editedFiles.push({
+              operation: "set",
+              file_path: f["filePath"] as string,
+              uri: f["filePath"] as string,
+              new_content: typeof f["newContent"] === "string" ? (f["newContent"] as string) : undefined,
+              additions: typeof f["additions"] === "number" ? f["additions"] : undefined,
+              deletions: typeof f["deletions"] === "number" ? f["deletions"] : undefined,
+            })
+          }
+        }
+      }
+    }
 
     return {
       assistantMessageID,
       text,
-      proposals: Array.from(proposals.values()),
+      files: editedFiles,
     }
   }
 
@@ -385,6 +417,29 @@ export class OpencodeClient implements vscode.Disposable {
 
     if (!response.ok) {
       throw new Error(`Failed to revert OpenCode session (${response.status})`)
+    }
+  }
+
+  private async replyPermission(
+    baseUrl: string,
+    requestID: string,
+    reply: "once" | "always" | "reject",
+    directory?: string,
+    message?: string,
+  ) {
+    const query = new URLSearchParams()
+    if (directory) query.set("directory", directory)
+
+    const response = await fetch(`${baseUrl}/permission/${encodeURIComponent(requestID)}/reply?${query.toString()}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ reply, ...(message ? { message } : {}) }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to reply to permission request (${response.status})`)
     }
   }
 
@@ -418,13 +473,11 @@ export class OpencodeClient implements vscode.Disposable {
     prompt: string,
     directory?: string,
     model?: { providerID: string; modelID: string },
-    executionMode?: "direct" | "propose",
   ) {
     const query = new URLSearchParams()
     if (directory) query.set("directory", directory)
 
     const body: PromptAsyncBody = {
-      executionMode: executionMode ?? "propose",
       model,
       parts: [
         {
@@ -575,6 +628,28 @@ export class OpencodeClient implements vscode.Disposable {
 
 function sessionIDFromProperties(properties: Record<string, unknown> | undefined) {
   return asString(properties?.["sessionID"])
+}
+
+function permissionRequestFromProperties(properties: Record<string, unknown> | undefined): PermissionRequest | undefined {
+  if (!properties) return
+
+  const id = asString(properties["id"])
+  const sessionID = asString(properties["sessionID"])
+  const permission = asString(properties["permission"])
+  if (!id || !sessionID || !permission) return
+
+  const patterns = toArray(properties["patterns"]).flatMap((item) => (typeof item === "string" ? [item] : []))
+  const always = toArray(properties["always"]).flatMap((item) => (typeof item === "string" ? [item] : []))
+  const metadata = toRecord(properties["metadata"]) ?? {}
+
+  return {
+    id,
+    sessionID,
+    permission,
+    patterns,
+    always,
+    metadata,
+  }
 }
 
 function safeJsonParse(value: string) {

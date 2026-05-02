@@ -10,7 +10,6 @@ import DESCRIPTION from "./read.txt"
 import { Instance } from "../project/instance"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
-import { SessionProposedFiles } from "@/session/proposed-files"
 import { isImageAttachment, isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 
 const DEFAULT_READ_LIMIT = 2000
@@ -59,11 +58,8 @@ export const ReadTool = Tool.define(
       return yield* Effect.fail(new Error(`File not found: ${filepath}`))
     })
 
-    const list = Effect.fn("ReadTool.list")(function* (filepath: string, run?: SessionProposedFiles.Run) {
-      const items =
-        run
-          ? yield* SessionProposedFiles.listDirectoryEntries(run, fs, filepath)
-          : yield* fs.readDirectoryEntries(filepath)
+    const list = Effect.fn("ReadTool.list")(function* (filepath: string) {
+      const items = yield* fs.readDirectoryEntries(filepath)
       return yield* Effect.forEach(
         items,
         Effect.fnUntraced(function* (item) {
@@ -156,29 +152,15 @@ export const ReadTool = Tool.define(
       if (process.platform === "win32") {
         filepath = AppFileSystem.normalizePath(filepath)
       }
-      const mode = Tool.executionMode(ctx)
-      const proposedFiles = ctx.proposedFiles
-      if (mode === "propose" && !proposedFiles) {
-        return yield* Effect.fail(new Error("Propose mode requires proposedFiles context"))
-      }
 
-      const overlayEntry = mode === "propose" ? SessionProposedFiles.get(proposedFiles, filepath) : undefined
-      const overlayChildren = mode === "propose" && SessionProposedFiles.hasChildren(proposedFiles, filepath)
       const title = path.relative(Instance.worktree, filepath)
 
-      const stat =
-        overlayEntry?.type === "file"
-          ? { type: "File" as const }
-          : overlayEntry?.type === "delete"
-            ? undefined
-            : overlayChildren
-              ? { type: "Directory" as const }
-              : yield* fs.stat(filepath).pipe(
-                  Effect.catchIf(
-                    (err) => "reason" in err && err.reason._tag === "NotFound",
-                    () => Effect.succeed(undefined),
-                  ),
-                )
+      const stat = yield* fs.stat(filepath).pipe(
+        Effect.catchIf(
+          (err) => "reason" in err && err.reason._tag === "NotFound",
+          () => Effect.succeed(undefined),
+        ),
+      )
 
       yield* assertExternalDirectoryEffect(ctx, filepath, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
@@ -195,7 +177,7 @@ export const ReadTool = Tool.define(
       if (!stat) return yield* miss(filepath)
 
       if (stat.type === "Directory") {
-        const items = yield* list(filepath, mode === "propose" ? proposedFiles : undefined)
+        const items = yield* list(filepath)
         const limit = params.limit ?? DEFAULT_READ_LIMIT
         const offset = params.offset ?? 1
         const start = offset - 1
@@ -223,12 +205,9 @@ export const ReadTool = Tool.define(
       }
 
       const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
-      const sample =
-        overlayEntry?.type === "file"
-          ? new Uint8Array()
-          : yield* readSample(filepath, "size" in stat ? Number(stat.size) : 0, SAMPLE_BYTES)
+      const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
       const mime = sniffAttachmentMime(sample, AppFileSystem.mimeType(filepath))
-      if (overlayEntry?.type !== "file" && (isImageAttachment(mime) || isPdfAttachment(mime))) {
+      if (isImageAttachment(mime) || isPdfAttachment(mime)) {
         const bytes = yield* fs.readFile(filepath)
         const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
         return {
@@ -249,16 +228,13 @@ export const ReadTool = Tool.define(
         }
       }
 
-          if (overlayEntry?.type !== "file" && isBinaryFile(filepath, sample)) {
+      if (isBinaryFile(filepath, sample)) {
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file =
-        overlayEntry?.type === "file"
-          ? linesFromContent(overlayEntry.content, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset ?? 1 })
-          : yield* Effect.promise(() =>
-              lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset ?? 1 }),
-            )
+      const file = yield* Effect.promise(() =>
+        lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset ?? 1 }),
+      )
       if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
         return yield* Effect.fail(
           new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
@@ -347,37 +323,4 @@ async function lines(filepath: string, opts: { limit: number; offset: number }) 
   }
 
   return { raw, count, cut, more, offset: opts.offset }
-}
-
-function linesFromContent(content: string, opts: { limit: number; offset: number }) {
-  const start = opts.offset - 1
-  const lines = content.split(/\r?\n/)
-  if (lines.length > 0 && lines[lines.length - 1] === "") {
-    lines.pop()
-  }
-
-  const raw: string[] = []
-  let bytes = 0
-  let cut = false
-  let more = false
-
-  for (let i = start; i < lines.length; i++) {
-    if (raw.length >= opts.limit) {
-      more = true
-      continue
-    }
-
-    const text = lines[i]
-    const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-    const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-    if (bytes + size > MAX_BYTES) {
-      cut = true
-      more = true
-      break
-    }
-    raw.push(line)
-    bytes += size
-  }
-
-  return { raw, count: lines.length, cut, more, offset: opts.offset }
 }

@@ -49,8 +49,6 @@ import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { EffectBridge } from "@/effect"
-import { ExecutionMode, resolveExecutionMode, type ExecutionMode as SessionExecutionMode } from "./execution-mode"
-import { SessionProposedFiles } from "./proposed-files"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -77,10 +75,7 @@ export interface Interface {
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
-interface PromptRuntime {
-  readonly executionMode: SessionExecutionMode
-  readonly proposedFiles?: SessionProposedFiles.Run
-}
+interface PromptRuntime {}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
 
@@ -378,8 +373,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         abort: options.abortSignal!,
         messageID: input.processor.message.id,
         callID: options.toolCallId,
-        executionMode: input.runtime.executionMode,
-        proposedFiles: input.runtime.proposedFiles,
         extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
         agent: input.agent.name,
         messages: input.messages,
@@ -607,8 +600,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           agent: task.agent,
           messageID: assistantMessage.id,
           sessionID,
-          executionMode: input.runtime.executionMode,
-          proposedFiles: input.runtime.proposedFiles,
           abort: taskAbort.signal,
           callID: part.callID,
           extra: { bypassAgentCheck: true, promptOps },
@@ -1304,7 +1295,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }
 
         if (input.noReply === true) return message
-        return yield* loop({ sessionID: input.sessionID, executionMode: input.executionMode }, runtime)
+        return yield* loop({ sessionID: input.sessionID }, runtime)
       })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1550,22 +1541,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       Effect.fn(
       "SessionPrompt.loop",
     )(function* (input: z.infer<typeof LoopInput>, runtime?: PromptRuntime) {
-      const executionMode = runtime?.executionMode ?? resolveExecutionMode(input.executionMode)
-      const nextRuntime: PromptRuntime =
-        runtime ??
-        (executionMode === "propose"
-          ? {
-              executionMode,
-              proposedFiles: SessionProposedFiles.create(),
-            }
-          : {
-              executionMode,
-            })
-
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        runLoop({ sessionID: input.sessionID, runtime: nextRuntime }),
+        runLoop({ sessionID: input.sessionID, runtime: runtime ?? {} }),
       )
     })
 
@@ -1750,7 +1729,6 @@ export const PromptInput = z.object({
   format: MessageV2.Format.optional(),
   system: z.string().optional(),
   variant: z.string().optional(),
-  executionMode: ExecutionMode.optional(),
   parts: z.array(
     z.discriminatedUnion("type", [
       MessageV2.TextPart.omit({
@@ -1800,7 +1778,6 @@ export type PromptInput = z.infer<typeof PromptInput>
 
 export const LoopInput = z.object({
   sessionID: SessionID.zod,
-  executionMode: ExecutionMode.optional(),
 })
 
 export const ShellInput = z.object({

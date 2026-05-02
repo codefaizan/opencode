@@ -18,8 +18,6 @@ import { Instance } from "../project/instance"
 import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
-import { SessionProposedFiles } from "@/session/proposed-files"
-import { Proposal } from "./proposal"
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -66,28 +64,14 @@ export const EditTool = Tool.define(
             ? params.filePath
             : path.join(Instance.directory, params.filePath)
           yield* assertExternalDirectoryEffect(ctx, filePath)
-          const mode = Tool.executionMode(ctx)
-          const proposedFiles = ctx.proposedFiles
-          if (mode === "propose" && !proposedFiles) {
-            throw new Error("Propose mode requires proposedFiles context")
-          }
 
           let diff = ""
           let contentOld = ""
           let contentNew = ""
           yield* Effect.gen(function* () {
             if (params.oldString === "") {
-              const existed =
-                mode === "propose"
-                  ? yield* SessionProposedFiles.exists(proposedFiles, afs, filePath)
-                  : yield* afs.existsSafe(filePath)
-              contentOld = existed
-                ? mode === "propose"
-                  ? yield* SessionProposedFiles.readFileString(proposedFiles, afs, filePath).pipe(
-                      Effect.catch(() => Effect.succeed("")),
-                    )
-                  : yield* afs.readFileString(filePath)
-                : ""
+              const existed = yield* afs.existsSafe(filePath)
+              contentOld = existed ? yield* afs.readFileString(filePath) : ""
               contentNew = params.newString
               diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
               yield* ctx.ask({
@@ -99,10 +83,6 @@ export const EditTool = Tool.define(
                   diff,
                 },
               })
-              if (mode === "propose") {
-                SessionProposedFiles.setFile(proposedFiles!, filePath, contentNew)
-                return
-              }
               yield* afs.writeWithDirs(filePath, params.newString)
               yield* format.file(filePath)
               yield* bus.publish(File.Event.Edited, { file: filePath })
@@ -113,26 +93,10 @@ export const EditTool = Tool.define(
               return
             }
 
-            if (mode === "propose") {
-              const overlayEntry = SessionProposedFiles.get(proposedFiles, filePath)
-              if (overlayEntry?.type === "delete") {
-                throw new Error(`File ${filePath} not found`)
-              }
-              if (overlayEntry?.type === "file") {
-                contentOld = overlayEntry.content
-              }
-              if (!contentOld) {
-                const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-                if (!info) throw new Error(`File ${filePath} not found`)
-                if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
-                contentOld = yield* afs.readFileString(filePath)
-              }
-            } else {
-              const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              if (!info) throw new Error(`File ${filePath} not found`)
-              if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
-              contentOld = yield* afs.readFileString(filePath)
-            }
+            const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (!info) throw new Error(`File ${filePath} not found`)
+            if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+            contentOld = yield* afs.readFileString(filePath)
 
             const ending = detectLineEnding(contentOld)
             const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
@@ -157,11 +121,6 @@ export const EditTool = Tool.define(
                 diff,
               },
             })
-
-            if (mode === "propose") {
-              SessionProposedFiles.setFile(proposedFiles!, filePath, contentNew)
-              return
-            }
 
             yield* afs.writeWithDirs(filePath, contentNew)
             yield* format.file(filePath)
@@ -197,54 +156,31 @@ export const EditTool = Tool.define(
               diff,
               filediff,
               diagnostics: {},
-              ...(mode === "propose"
-                ? {
-                    proposal: Proposal.payload([
-                      Proposal.setFile({
-                        filePath,
-                        newContent: contentNew,
-                        diff,
-                        additions: filediff.additions,
-                        deletions: filediff.deletions,
-                      }),
-                    ]),
-                  }
-                : {}),
             },
           })
 
-          let output = mode === "propose" ? "Edit proposed successfully." : "Edit applied successfully."
-          const diagnostics =
-            mode === "propose"
-              ? {}
-              : yield* Effect.gen(function* () {
-                  yield* lsp.touchFile(filePath, true)
-                  return yield* lsp.diagnostics()
-                })
-          if (mode !== "propose") {
-            const normalizedFilePath = AppFileSystem.normalizePath(filePath)
-            const block = LSP.Diagnostic.report(filePath, diagnostics[normalizedFilePath] ?? [])
-            if (block) output += `\n\nLSP errors detected in this file, please fix:\n${block}`
-          }
+          const diagnostics = yield* Effect.gen(function* () {
+            yield* lsp.touchFile(filePath, true)
+            return yield* lsp.diagnostics()
+          })
+          const normalizedFilePath = AppFileSystem.normalizePath(filePath)
+          const lspErrors = LSP.Diagnostic.report(filePath, diagnostics[normalizedFilePath] ?? [])
+          let output = "Edit applied successfully."
+          if (lspErrors) output += "\n\nLSP errors detected in this file, please fix:\n" + lspErrors
 
           return {
             metadata: {
               diagnostics,
               diff,
               filediff,
-              ...(mode === "propose"
-                ? {
-                    proposal: Proposal.payload([
-                      Proposal.setFile({
-                        filePath,
-                        newContent: contentNew,
-                        diff,
-                        additions: filediff.additions,
-                        deletions: filediff.deletions,
-                      }),
-                    ]),
-                  }
-                : {}),
+              editedFiles: [
+                {
+                  filePath,
+                  newContent: contentNew,
+                  additions: filediff.additions,
+                  deletions: filediff.deletions,
+                },
+              ],
             },
             title: `${path.relative(Instance.worktree, filePath)}`,
             output,
